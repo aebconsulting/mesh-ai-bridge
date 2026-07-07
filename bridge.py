@@ -37,7 +37,8 @@ MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:8b")
 PREFIX = os.environ.get("TRIGGER_PREFIX", "@ai").lower()
 ALLOWED = {int(c) for c in os.environ.get("ALLOWED_CHANNELS", "0").split(",") if c.strip() != ""}
 CHUNK = int(os.environ.get("CHUNK_BYTES", "190"))
-MAX_CHUNKS = int(os.environ.get("MAX_REPLY_CHUNKS", "2"))
+MAX_CHUNKS = int(os.environ.get("MAX_REPLY_CHUNKS", "2"))          # channel replies: shared airtime, stay lean
+MAX_CHUNKS_DM = int(os.environ.get("MAX_REPLY_CHUNKS_DM", "3"))    # DMs: point-to-point, room for a full answer
 COOLDOWN = int(os.environ.get("NODE_COOLDOWN_S", "30"))
 PER_MIN = int(os.environ.get("GLOBAL_PER_MIN", "6"))
 MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "600"))
@@ -715,11 +716,12 @@ def _byte_prefix(s, max_bytes):
         return s
     return b[:max_bytes].decode("utf-8", "ignore")
 
-def chunk_reply(text):
+def chunk_reply(text, max_chunks=None):
+    mc = max_chunks or MAX_CHUNKS
     if not text:
         return []
     chunks = []
-    while text and len(chunks) < MAX_CHUNKS:
+    while text and len(chunks) < mc:
         if len(text.encode()) <= CHUNK:
             chunks.append(text)
             break
@@ -728,7 +730,7 @@ def chunk_reply(text):
         piece = (m.group(0) if m and len(m.group(0)) > CHUNK // 3 else cut).rstrip() or cut
         chunks.append(piece)
         text = text[len(piece):].lstrip()
-    if text and len(chunks) == MAX_CHUNKS:
+    if text and len(chunks) == mc:
         # Reserve 4 bytes for " ..." so the final chunk still fits the budget (the old
         # CHUNK-2 slice + 4-byte suffix overflowed by 2 bytes even in pure ASCII).
         chunks[-1] = _byte_prefix(chunks[-1], CHUNK - 4).rstrip() + " ..."
@@ -858,14 +860,14 @@ def _worker():
             except Exception as e:
                 log("CRITICAL: work_q.get() failed: {}".format(e)); continue
             try:
-                sender, ch, query, send = item
+                sender, ch, query, send, is_dm = item
             except Exception as e:
                 log("CRITICAL: malformed queue item dropped (unpack failed): {} raw={!r}".format(e, item))
                 try: work_q.task_done()
                 except Exception: pass
                 continue
             try:
-                handle_query(sender, ch, query, send)
+                handle_query(sender, ch, query, send, is_dm)
             except Exception as e:
                 log("worker error handling query from {} (continuing): {}".format(sender, e))
             finally:
@@ -887,7 +889,7 @@ def start_worker():
 iface = None
 my_num = None
 
-def handle_query(sender, ch, query, send):
+def handle_query(sender, ch, query, send, is_dm=False):
     m = re.match(r"^(remember|forget)\s+(.+)$", query, re.I)
     if m:
         if sender.lower() not in ADMIN_NODES:
@@ -912,7 +914,7 @@ def handle_query(sender, ch, query, send):
         return
     add_msg(sender, "user", query)
     add_msg(sender, "assistant", reply)
-    for i, c in enumerate(chunk_reply(reply)):
+    for i, c in enumerate(chunk_reply(reply, MAX_CHUNKS_DM if is_dm else MAX_CHUNKS)):
         send(c)
         log("reply {} ({}B): {}".format(i + 1, len(c.encode()), repr(c)))
         time.sleep(CHUNK_DELAY_S)
@@ -965,7 +967,7 @@ def on_receive(packet=None, interface=None):
         waited = 0.0
         while True:
             try:
-                work_q.put((sender, ch, query, send), timeout=5); break
+                work_q.put((sender, ch, query, send, is_dm), timeout=5); break
             except _queue.Full:
                 waited += 5
                 log("queue still full after {:.0f}s — holding radio thread for {} (queue_depth={})".format(
