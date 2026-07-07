@@ -101,6 +101,7 @@ send_api_alive = False               # v6/A1: True while the send-API server thr
 # radio thread if momentarily full), never a drop. See _worker()/on_receive for the policy.
 work_q = _queue.Queue(maxsize=QUEUE_MAX)
 worker_alive = False
+_pending = {}   # sender -> untransmitted reply overflow, pulled with "@ai more" (worker thread only)
 last_progress_ts = 0.0                   # v6/2b-ii F7: last time the worker finished (or attempted) an item — staleness metric
 _seen_ids = collections.OrderedDict()   # packet_id -> ts, for retransmit dedup
 
@@ -467,8 +468,13 @@ def get_facts():
         rows = c.execute("SELECT sender, content FROM facts ORDER BY id DESC LIMIT ?", (FACTS_MAX,)).fetchall()
     return list(reversed(rows))
 
-def build_messages(sender, query):
+def build_messages(sender, query, is_dm=False):
     sys_parts = [SYSPROMPT]
+    # Authoritative per-path size budget (overrides the generic prompt limit): the chunker
+    # truncates at this many bytes, so anything past it is lost airtime.
+    sys_parts.append("HARD LIMIT for this reply: {} characters. This overrides any other length "
+                     "guidance. If the full answer will not fit, give only the most critical "
+                     "facts and stop cleanly.".format(CHUNK * (MAX_CHUNKS_DM if is_dm else MAX_CHUNKS) - 40))
     lib = library_context(query)
     if lib:
         sys_parts.append("Offline library context (prefer this; cite the book briefly):")
@@ -717,24 +723,35 @@ def _byte_prefix(s, max_bytes):
     return b[:max_bytes].decode("utf-8", "ignore")
 
 def chunk_reply(text, max_chunks=None):
+    """Split text into <=max_chunks LoRa-sized pieces, preferring sentence boundaries.
+    Returns (chunks, remainder): remainder is the untransmitted tail ('' if it all fit) —
+    the caller banks it for '@ai more' instead of amputating it."""
     mc = max_chunks or MAX_CHUNKS
     if not text:
-        return []
+        return [], ""
     chunks = []
     while text and len(chunks) < mc:
         if len(text.encode()) <= CHUNK:
             chunks.append(text)
+            text = ""
             break
         cut = _byte_prefix(text, CHUNK)                 # byte-bounded, not char-bounded
         m = re.search(r"^.*[.!?]\s", cut, re.S)
         piece = (m.group(0) if m and len(m.group(0)) > CHUNK // 3 else cut).rstrip() or cut
         chunks.append(piece)
         text = text[len(piece):].lstrip()
-    if text and len(chunks) == mc:
-        # Reserve 4 bytes for " ..." so the final chunk still fits the budget (the old
-        # CHUNK-2 slice + 4-byte suffix overflowed by 2 bytes even in pure ASCII).
-        chunks[-1] = _byte_prefix(chunks[-1], CHUNK - 4).rstrip() + " ..."
-    return chunks
+    return chunks, text
+
+def mark_more(chunks):
+    """Stamp the last chunk with the continuation hint, keeping it inside the byte budget.
+    Returns any text the stamp displaced so the caller banks it with the remainder —
+    otherwise a near-full final chunk would silently lose up to 7 bytes."""
+    if not chunks:
+        return ""
+    last = chunks[-1]
+    kept = _byte_prefix(last, CHUNK - 7).rstrip()
+    chunks[-1] = kept + " [more]"
+    return last[len(kept):].strip()
 
 # ---------- dashboard send API (v6) ----------
 # Token-gated HTTP endpoint so the dashboard can transmit THROUGH the bridge
@@ -890,6 +907,19 @@ iface = None
 my_num = None
 
 def handle_query(sender, ch, query, send, is_dm=False):
+    if query.lower() in ("more", "continue"):
+        # Continuation pull: deliver the next installment of this sender's banked overflow.
+        # No LLM call — this is a deterministic read of what was already generated.
+        rest = _pending.pop(sender, "")
+        if not rest:
+            send("Nothing more pending.")
+            return
+        mc = MAX_CHUNKS_DM if is_dm else MAX_CHUNKS
+        chunks, rest2 = chunk_reply(rest, mc)
+        if rest2:
+            _pending[sender] = (mark_more(chunks) + " " + rest2).strip()
+        _send_chunks(chunks, send)
+        return
     m = re.match(r"^(remember|forget)\s+(.+)$", query, re.I)
     if m:
         if sender.lower() not in ADMIN_NODES:
@@ -908,13 +938,23 @@ def handle_query(sender, ch, query, send, is_dm=False):
             log("forget by {}: {} ({} rows)".format(sender, repr(arg), n))
         return
     try:
-        reply = ask_llm(build_messages(sender, query))
+        reply = ask_llm(build_messages(sender, query, is_dm))
     except Exception as e:
         log("LLM unreachable, dropping message: {}".format(e))
         return
+    mc = MAX_CHUNKS_DM if is_dm else MAX_CHUNKS
+    chunks, rest = chunk_reply(reply, mc)
+    if rest:
+        # Overflow is banked, not discarded: the reply ends '[more]' and '@ai more' pulls the
+        # next installment. (A model-side compression pass was tried and reverted — the LLM
+        # doesn't reliably obey character limits and sometimes rewrote LONGER.)
+        _pending[sender] = (mark_more(chunks) + " " + rest).strip()
     add_msg(sender, "user", query)
     add_msg(sender, "assistant", reply)
-    for i, c in enumerate(chunk_reply(reply, MAX_CHUNKS_DM if is_dm else MAX_CHUNKS)):
+    _send_chunks(chunks, send)
+
+def _send_chunks(chunks, send):
+    for i, c in enumerate(chunks):
         send(c)
         log("reply {} ({}B): {}".format(i + 1, len(c.encode()), repr(c)))
         time.sleep(CHUNK_DELAY_S)
@@ -958,7 +998,9 @@ def on_receive(packet=None, interface=None):
             log("dropping duplicate retransmit from {} (pkt_id={}, query={!r})".format(
                 sender, packet.get("id"), query))
             return
-        if not allowed_now(sender):
+        # "more" is a user-pulled continuation of an already-generated reply — exempting it
+        # from the cooldown lets the next installment come immediately (dedup still applies).
+        if query.lower() not in ("more", "continue") and not allowed_now(sender):
             log("rate-limited {}".format(sender))
             return
         log("query from {} {} : {}".format(sender, "DM" if is_dm else "ch{}".format(ch), repr(query)))
