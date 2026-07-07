@@ -85,6 +85,9 @@ NET_CACHE_TTL_S = int(os.environ.get("NET_CACHE_TTL_S", "600"))      # reuse fet
 NET_DEFAULT_PLACE = os.environ.get("NET_DEFAULT_PLACE", "").strip()  # used when a live query names no location
 SEARX_URL = os.environ.get("SEARX_URL", "").strip()   # local SearXNG for general live search; empty disables
 SEARCH_RESULTS = int(os.environ.get("SEARCH_RESULTS", "4"))          # top-N snippets injected per search
+# v8.1: multi-chunk delivery. 2s spacing lost chunk 2 on a busy mesh (fire-and-forget TX
+# collided with chunk 1's still-in-flight routing traffic); give each chunk clear air.
+CHUNK_DELAY_S = float(os.environ.get("CHUNK_DELAY_S", "8"))
 
 last_by_node = {}
 recent = collections.deque()
@@ -912,7 +915,7 @@ def handle_query(sender, ch, query, send):
     for i, c in enumerate(chunk_reply(reply)):
         send(c)
         log("reply {} ({}B): {}".format(i + 1, len(c.encode()), repr(c)))
-        time.sleep(2)
+        time.sleep(CHUNK_DELAY_S)
 
 def on_receive(packet=None, interface=None):
     try:
@@ -933,14 +936,18 @@ def on_receive(packet=None, interface=None):
             return
         query = text[len(PREFIX):].strip()
         if is_dm:
-            # Direct message to the AI node: reply privately to the sender.
+            # Direct message to the AI node: reply privately to the sender. wantAck=True gets
+            # firmware-level retransmits (up to 3) if the sender doesn't confirm receipt —
+            # fire-and-forget DMs silently lost chunk 2 of multi-chunk replies on a busy mesh.
             send = lambda c: (log_traffic("out", sender, node_name, ch, True, True, c),
-                              interface.sendText(c, destinationId=sender))[1]
+                              interface.sendText(c, destinationId=sender, wantAck=True))[1]
         else:
             if ch not in ALLOWED:
                 return
+            # Broadcast wantAck uses the implicit-ack (a neighbor rebroadcasting counts);
+            # firmware retransmits if nobody is heard repeating it.
             send = lambda c: (log_traffic("out", sender, node_name, ch, False, True, c),
-                              interface.sendText(c, channelIndex=ch))[1]
+                              interface.sendText(c, channelIndex=ch, wantAck=True))[1]
         if not query:
             return
         # DEDUP BEFORE the rate-limit (C1): a radio retransmit must not burn a rate slot or
