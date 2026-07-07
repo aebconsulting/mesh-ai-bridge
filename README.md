@@ -73,6 +73,24 @@ containerized setups where the radio is exposed via ser2net / meshtasticd). For 
 text starting with the trigger prefix (`@ai`), it assembles context (library + memory),
 calls the model, and sends the chunked reply back to the sender (DM) or channel.
 
+## Live data (mesh sensors + optional internet backup)
+
+**Mesh weather telemetry (v7, always on):** nodes carrying BME280/680 sensors broadcast
+temperature/humidity/pressure; the bridge records every reading (`env_log`) and injects an
+aggregate of the last hour's conditions into the AI context. Fully offline — the sensors ARE
+the weather station.
+
+**Internet backup (v8, `NET_BACKUP=true`, default off):** when the host happens to be online,
+live-data questions get real answers. A cached connectivity probe gates every fetch; offline,
+behavior is byte-identical to the offline-only build — no errors, no hangs, honest answers.
+
+- **Live weather** — keyless APIs (Open-Meteo, zippopotam.us). Location comes from the query
+  ("weather in 33040"), else the **asking node's GPS position**, else the bridge node's GPS,
+  else `NET_DEFAULT_PLACE`. A GPS handheld in the field gets weather for where it stands.
+- **Live web search** (`SEARX_URL`) — general questions via your own SearXNG instance:
+  `@ai search <anything>` always searches; news/price/score/"latest"-shaped questions search
+  automatically. Top snippets ride into the model's context.
+
 ## ⚠️ Safety
 
 This forwards **AI-generated** text over radio, including for medical, survival, and

@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v6 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v8 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v8 adds NET_BACKUP: when the host happens to have internet, live-data questions (weather/
+forecast) are answered with real current conditions from keyless public APIs (Open-Meteo +
+zippopotam.us zip geocoding). A cached connectivity probe gates every fetch; offline the
+bridge behaves exactly as before (mesh sensors + honest "no live data"). Default OFF.
+
+v7 adds ENVIRONMENT_METRICS capture: nodes with weather sensors (BME280/680) broadcast
+temperature/humidity/pressure telemetry across the mesh; the bridge records it to env_log
+and injects an aggregated "current local weather" line into the AI context — real local
+conditions with no internet, the off-grid-native weather source.
 
 v4 adds MESH_TCP_HOST: connect to the radio via TCP (ser2net/meshtasticd) for the
 containerized deployment; unset = native serial mode (rollback path).
@@ -63,6 +73,18 @@ SEND_COOLDOWN_S = int(os.environ.get("SEND_COOLDOWN_S", "5"))
 # v6/2b-ii: bounded no-drop query queue in front of handle_query.
 QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "100"))
 DEDUP_TTL_S = int(os.environ.get("DEDUP_TTL_S", "120"))
+# v7: environmental telemetry -> "current local weather" from mesh sensor nodes.
+ENV_WINDOW_S = int(os.environ.get("ENV_WINDOW_S", "3600"))   # only readings this fresh count as "current"
+ENV_TEMP_UNIT = os.environ.get("ENV_TEMP_UNIT", "F").upper()  # Meshtastic reports Celsius; display F (US) or C
+# v8: internet backup for live-data queries. Keyless APIs only (Open-Meteo, zippopotam.us) -
+# nothing to configure or leak. Default OFF so the public image stays offline-first.
+NET_BACKUP = os.environ.get("NET_BACKUP", "").lower() in ("1", "true", "yes")
+NET_TIMEOUT_S = float(os.environ.get("NET_TIMEOUT_S", "6"))          # per-request budget for live fetches
+NET_PROBE_TTL_S = int(os.environ.get("NET_PROBE_TTL_S", "60"))       # cache the online/offline verdict this long
+NET_CACHE_TTL_S = int(os.environ.get("NET_CACHE_TTL_S", "600"))      # reuse fetched conditions per place this long
+NET_DEFAULT_PLACE = os.environ.get("NET_DEFAULT_PLACE", "").strip()  # used when a live query names no location
+SEARX_URL = os.environ.get("SEARX_URL", "").strip()   # local SearXNG for general live search; empty disables
+SEARCH_RESULTS = int(os.environ.get("SEARCH_RESULTS", "4"))          # top-N snippets injected per search
 
 last_by_node = {}
 recent = collections.deque()
@@ -97,6 +119,11 @@ def db():
     # nodes: latest telemetry snapshot per node (position, battery, signal, last heard).
     c.execute("CREATE TABLE IF NOT EXISTS nodes(node_id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, "
               "lat REAL, lon REAL, battery INTEGER, snr REAL, hops INTEGER, last_heard REAL, updated REAL)")
+    # v7: env_log - append-only environmental telemetry (temp/humidity/pressure) per node, for
+    # "current local weather" aggregation and (future) pressure-trend storm detection.
+    c.execute("CREATE TABLE IF NOT EXISTS env_log(id INTEGER PRIMARY KEY, ts REAL, node_id TEXT, "
+              "node_name TEXT, temperature REAL, humidity REAL, pressure REAL, lat REAL, lon REAL)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_env_log_ts ON env_log(ts)")
     return c
 
 def log_traffic(direction, node_id, node_name, channel, is_dm, is_ai, text):
@@ -130,17 +157,292 @@ def snapshot_nodes(interface):
         return 0
 
 def prune_msg_log():
-    """v6: msg_log shares memory.db with the AI memory (backed up nightly) - cap growth.
-    Returns True on success, False on failure so the caller can retry (A3)."""
+    """v6/v7: msg_log + env_log share memory.db with the AI memory (backed up nightly) - cap
+    growth. Returns True on success, False on failure so the caller can retry (A3)."""
     try:
         with db() as c:
-            n = c.execute("DELETE FROM msg_log WHERE ts < ?", (time.time() - RETENTION_DAYS * 86400,)).rowcount
-        if n:
-            log("msg_log pruned {} rows older than {}d".format(n, RETENTION_DAYS))
+            cutoff = time.time() - RETENTION_DAYS * 86400
+            n = c.execute("DELETE FROM msg_log WHERE ts < ?", (cutoff,)).rowcount
+            e = c.execute("DELETE FROM env_log WHERE ts < ?", (cutoff,)).rowcount
+        if n or e:
+            log("pruned msg_log {} / env_log {} rows older than {}d".format(n, e, RETENTION_DAYS))
         return True
     except Exception as e:
-        log("msg_log prune failed: {}".format(e))
+        log("prune failed: {}".format(e))
         return False
+
+# ---------- environmental telemetry (v7) ----------
+_env_seen = False   # loud one-time confirmation that weather data IS flowing on this mesh
+
+def log_env(node_id, node_name, temp, humidity, pressure, lat, lon):
+    """Store one environmental reading. Loudly logs the FIRST env packet ever seen so a
+    deploy immediately answers 'do any nodes broadcast weather telemetry?'."""
+    global _env_seen
+    if temp is None and humidity is None and pressure is None:
+        return   # a telemetry packet with no environment fields (device metrics only) - ignore
+    try:
+        with db() as c:
+            c.execute("INSERT INTO env_log(ts, node_id, node_name, temperature, humidity, pressure, lat, lon) "
+                      "VALUES(?,?,?,?,?,?,?,?)",
+                      (time.time(), node_id, node_name, temp, humidity, pressure, lat, lon))
+        if not _env_seen:
+            _env_seen = True
+            log("ENV TELEMETRY CONFIRMED on mesh - first weather reading from {}: "
+                "temp={}C humidity={}% pressure={}hPa".format(node_name, temp, humidity, pressure))
+    except Exception as e:
+        log("env_log write failed: {}".format(e))
+
+def on_telemetry(packet=None, interface=None):
+    """Subscribed to meshtastic.receive.telemetry. Extracts environmentMetrics (temp/humidity/
+    pressure) and records them; ignores device-only telemetry. Never raises out (a telemetry
+    handler error must not affect text handling)."""
+    try:
+        env = ((packet or {}).get("decoded", {}).get("telemetry", {}) or {}).get("environmentMetrics") or {}
+        if not env:
+            return
+        sender = packet.get("fromId") or hex(packet.get("from", 0))
+        n = (getattr(interface, "nodes", None) or {}).get(sender, {}) or {}
+        p = n.get("position", {}) or {}
+        log_env(sender, node_display(interface, sender),
+                env.get("temperature"), env.get("relativeHumidity"), env.get("barometricPressure"),
+                p.get("latitude"), p.get("longitude"))
+    except Exception as e:
+        log("telemetry handler error: {}".format(e))
+
+def weather_context():
+    """Aggregate the freshest per-node environmental readings (last ENV_WINDOW_S) into a short
+    'current local weather' line for the AI. Returns '' if no recent sensor data exists (so it
+    injects nothing rather than a stale or empty claim)."""
+    try:
+        with db() as c:
+            rows = c.execute("SELECT node_name, temperature, humidity, pressure, ts FROM env_log "
+                             "WHERE ts > ? ORDER BY ts DESC", (time.time() - ENV_WINDOW_S,)).fetchall()
+    except Exception as e:
+        log("weather_context read failed: {}".format(e))
+        return ""
+    latest = {}
+    for name, t, h, p, ts in rows:
+        latest.setdefault(name, (t, h, p))   # rows are ts-desc, so first-seen per node = freshest
+    def avg(i):
+        vals = [v[i] for v in latest.values() if v[i] is not None]
+        return sum(vals) / len(vals) if vals else None
+    at, ah, ap = avg(0), avg(1), avg(2)
+    parts = []
+    if at is not None:
+        parts.append("temp {:.0f}F".format(at * 9 / 5 + 32) if ENV_TEMP_UNIT == "F" else "temp {:.0f}C".format(at))
+    if ah is not None:
+        parts.append("humidity {:.0f}%".format(ah))
+    if ap is not None:
+        parts.append("pressure {:.0f} hPa".format(ap))
+    if not parts:
+        return ""
+    return "Live local weather from {} mesh sensor node(s), measured within the last hour: {}.".format(
+        len(latest), ", ".join(parts))
+
+# ---------- internet backup for live-data queries (v8) ----------
+# All state below is only touched from the single query-worker thread; no locking needed.
+_net_verdict = (0.0, False)          # (checked_at, online) - cached connectivity probe
+_geo_cache = {}                      # place-string -> (lat, lon, display_name)
+_wx_cache = {}                       # display_name -> (fetched_at, context_line)
+_WMO = {0: "clear", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+        45: "fog", 48: "fog", 51: "drizzle", 53: "drizzle", 55: "drizzle",
+        61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+        71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow", 80: "rain showers",
+        81: "rain showers", 82: "violent rain showers", 85: "snow showers", 86: "snow showers",
+        95: "thunderstorm", 96: "thunderstorm w/ hail", 99: "thunderstorm w/ hail"}
+_LIVE_WX_RE = re.compile(r"\b(weather|forecast|temperature|temp|rain(ing)?|wind(y)?|storm|hurricane"
+                         r"|humidity|heat index|hot out|cold out|uv|barometer)\b", re.I)
+
+def _net_online():
+    """Cached internet probe. One tiny request answers 'are we online?' for NET_PROBE_TTL_S,
+    so offline deployments pay one fast timeout a minute at most, not one per query."""
+    global _net_verdict
+    checked, online = _net_verdict
+    if time.time() - checked < NET_PROBE_TTL_S:
+        return online
+    try:
+        requests.get("https://api.open-meteo.com/v1/forecast?latitude=0&longitude=0&current=temperature_2m",
+                     timeout=min(NET_TIMEOUT_S, 3))
+        online = True
+    except Exception:
+        online = False
+    _net_verdict = (time.time(), online)
+    log("net_backup: probe -> {}".format("online" if online else "offline"))
+    return online
+
+def _extract_place(query):
+    """Pull a location out of the query: a US zip wins, then 'in/for/at/near <place>',
+    then NET_DEFAULT_PLACE. Returns '' if nothing to go on."""
+    z = re.search(r"\b(\d{5})\b", query)
+    if z:
+        return z.group(1)
+    m = re.search(r"\b(?:in|for|at|near)\s+([A-Za-z][A-Za-z .'\-]{2,40}?)"
+                  r"(?:[?.!,]|\s+(?:today|tonight|tomorrow|now|right|this|next)\b|$)", query)
+    if m:
+        return m.group(1).strip()
+    return ""   # nothing explicit; caller falls back to GPS, then NET_DEFAULT_PLACE
+
+def _node_latlon(node_id):
+    """GPS position for a node from the 60s node snapshot; None if it has no fix."""
+    if not node_id:
+        return None
+    try:
+        with db() as c:
+            r = c.execute("SELECT lat, lon FROM nodes WHERE node_id=? AND lat IS NOT NULL "
+                          "AND lon IS NOT NULL", (node_id,)).fetchone()
+        return (r[0], r[1]) if r else None
+    except Exception:
+        return None
+
+def _revgeo(lat, lon):
+    """Coords -> 'City, Region' via keyless BigDataCloud; falls back to raw coords. Cached
+    (rounded to ~1km) so a stationary node costs one lookup, not one per weather query."""
+    key = ("rev", round(lat, 2), round(lon, 2))
+    if key in _geo_cache:
+        return _geo_cache[key]
+    name = "{:.3f}, {:.3f}".format(lat, lon)
+    try:
+        j = requests.get("https://api.bigdatacloud.net/data/reverse-geocode-client",
+                         params={"latitude": lat, "longitude": lon, "localityLanguage": "en"},
+                         timeout=NET_TIMEOUT_S).json()
+        # locality is neighborhood/town-accurate; city is metro-level (returns "Miami" for
+        # the whole South FL metro) - prefer locality.
+        n = ", ".join(x for x in (j.get("locality") or j.get("city"), j.get("principalSubdivision")) if x)
+        if n:
+            name = n
+    except Exception as e:
+        log("net_backup: reverse geocode failed: {}".format(e))
+    _geo_cache[key] = name
+    return name
+
+def _geocode(place):
+    """place -> (lat, lon, display_name) via keyless APIs; None on failure. Cached forever
+    (places do not move). US 5-digit zips use zippopotam.us; names use Open-Meteo geocoding."""
+    if place in _geo_cache:
+        return _geo_cache[place]
+    try:
+        if re.fullmatch(r"\d{5}", place):
+            j = requests.get("https://api.zippopotam.us/us/" + place, timeout=NET_TIMEOUT_S).json()
+            p = j["places"][0]
+            out = (float(p["latitude"]), float(p["longitude"]),
+                   "{}, {} {}".format(p["place name"], p["state abbreviation"], place))
+        else:
+            j = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                             params={"name": place, "count": 1}, timeout=NET_TIMEOUT_S).json()
+            r = (j.get("results") or [None])[0]
+            if not r:
+                return None
+            out = (r["latitude"], r["longitude"],
+                   ", ".join(x for x in (r.get("name"), r.get("admin1"), r.get("country_code")) if x))
+        _geo_cache[place] = out
+        return out
+    except Exception as e:
+        log("net_backup: geocode '{}' failed: {}".format(place, e))
+        return None
+
+def live_weather_context(query, sender=None):
+    """v8: real current conditions + today's outlook from the internet, when (a) the feature is
+    on, (b) the query looks weather/live-shaped, (c) the box is actually online. Location:
+    explicit place in the query, else the asking node's GPS, else the bridge node's own GPS,
+    else NET_DEFAULT_PLACE. Returns '' in every other case so offline behavior matches v7."""
+    if not NET_BACKUP or not _LIVE_WX_RE.search(query):
+        return ""
+    place = _extract_place(query)
+    lat = lon = name = None
+    if not place:
+        pos = _node_latlon(sender) or _node_latlon("!%08x" % my_num if my_num else None)
+        if pos:
+            lat, lon = pos
+        elif NET_DEFAULT_PLACE:
+            place = NET_DEFAULT_PLACE
+        else:
+            return ""
+    if not _net_online():
+        return ""
+    if place:
+        loc = _geocode(place)
+        if not loc:
+            return ""
+        lat, lon, name = loc
+    else:
+        name = _revgeo(lat, lon)
+    wx_key = (round(lat, 2), round(lon, 2))   # coord-keyed: same-named places can never collide
+    cached = _wx_cache.get(wx_key)
+    if cached and time.time() - cached[0] < NET_CACHE_TTL_S:
+        return cached[1]
+    try:
+        t0 = time.time()
+        j = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                       "weather_code,wind_speed_10m,wind_gusts_10m,precipitation",
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "forecast_days": 1, "timezone": "auto",
+            "temperature_unit": "fahrenheit", "wind_speed_unit": "mph"},
+            timeout=NET_TIMEOUT_S).json()
+        c, d = j["current"], j["daily"]
+        line = ("Current verified weather for {} (fetched seconds ago via the bridge's live data "
+                "link; answer with these numbers directly and do NOT add disclaimers about "
+                "internet or data access): "
+                "{:.0f}F (feels like {:.0f}F), {}, humidity {:.0f}%, wind {:.0f} mph (gusts {:.0f}). "
+                "Today: high {:.0f}F, low {:.0f}F, rain chance {:.0f}%.".format(
+                    name, c["temperature_2m"], c["apparent_temperature"],
+                    _WMO.get(c.get("weather_code"), "conditions n/a"), c["relative_humidity_2m"],
+                    c["wind_speed_10m"], c["wind_gusts_10m"],
+                    d["temperature_2m_max"][0], d["temperature_2m_min"][0],
+                    d["precipitation_probability_max"][0] or 0))
+        _wx_cache[wx_key] = (time.time(), line)
+        log("net_backup: live weather for {} in {:.1f}s".format(name, time.time() - t0))
+        return line
+    except Exception as e:
+        log("net_backup: forecast fetch for '{}' failed: {}".format(place, e))
+        return ""
+
+_LIVE_SEARCH_RE = re.compile(r"\b(news|latest|current(ly)?|today|tonight|breaking|headline"
+                             r"|price|stock|crypto|bitcoin|market|score|game|won|election"
+                             r"|update on|status of|traffic|open (now|today)|hours|schedule"
+                             r"|recall|outage|closure)\b", re.I)
+_search_cache = {}
+
+def live_search_context(query):
+    """v8: general live-data backup - web metasearch via the local SearXNG instance, when online.
+    An explicit 'search ...' / 'look up ...' always searches; otherwise only live-data-shaped
+    queries do. Returns '' offline or on no-match so offline behavior is unchanged."""
+    if not NET_BACKUP or not SEARX_URL:
+        return ""
+    m = re.match(r"(?:search|look ?up|google)\s*(?:for|:)?\s+(.{3,})", query, re.I)
+    if not m and not _LIVE_SEARCH_RE.search(query):
+        return ""
+    q = (m.group(1) if m else query).strip()
+    key = q.lower()
+    cached = _search_cache.get(key)
+    if cached and time.time() - cached[0] < NET_CACHE_TTL_S:
+        return cached[1]
+    if not _net_online():
+        return ""
+    try:
+        t0 = time.time()
+        j = requests.get(SEARX_URL.rstrip("/") + "/search", params={"q": q, "format": "json"},
+                         timeout=NET_TIMEOUT_S).json()
+        bits = []
+        for a in (j.get("answers") or [])[:2]:   # engine answer boxes, when present
+            bits.append(a.get("answer") if isinstance(a, dict) else str(a))
+        for r in (j.get("results") or [])[:SEARCH_RESULTS]:
+            t, c = r.get("title", ""), re.sub(r"\s+", " ", r.get("content") or "").strip()
+            if t or c:
+                bits.append("{}: {}".format(t, c[:200]) if c else t)
+        bits = [b for b in bits if b]
+        if not bits:
+            return ""
+        line = ("Live web search results for '" + q + "' (fetched seconds ago via the bridge's "
+                "live data link; answer from these snippets and do NOT add disclaimers about "
+                "internet or data access): " + " | ".join(bits))[:1500]
+        _search_cache[key] = (time.time(), line)
+        log("net_backup: search '{}' -> {} snippets in {:.1f}s".format(q[:40], len(bits), time.time() - t0))
+        return line
+    except Exception as e:
+        log("net_backup: search '{}' failed: {}".format(q[:40], e))
+        return ""
 
 def add_msg(sender, role, content):
     with db() as c:
@@ -167,13 +469,26 @@ def build_messages(sender, query):
     if lib:
         sys_parts.append("Offline library context (prefer this; cite the book briefly):")
         sys_parts.append(lib)
+    wx = weather_context()   # v7: real current conditions from mesh sensor nodes (offline)
+    if wx:
+        sys_parts.append(wx)
+    # v8: internet-backed live data, only when online - structured weather plus general web
+    # search; a query like "news about the hurricane" legitimately gets both.
+    lw = " ".join(x for x in (live_weather_context(query, sender), live_search_context(query)) if x)
     facts = get_facts()
     if facts:
         sys_parts.append("Known facts (remembered from prior conversations):")
         sys_parts += ["- [{}] {}".format(s, t) for s, t in facts]
     msgs = [{"role": "system", "content": "\n".join(sys_parts)}]
     msgs += get_history(sender)
-    msgs.append({"role": "user", "content": query})
+    # v8: the live-data line rides WITH the user turn, not the system prompt. A sender whose
+    # recent history is full of honest "no live data" replies otherwise pattern-matches their
+    # own past answers over a system-prompt fact (observed: qwen3-30b parroted old refusals).
+    if lw:
+        msgs.append({"role": "user", "content":
+                     "[{} Any earlier replies claiming no live data are outdated.]\n{}".format(lw, query)})
+    else:
+        msgs.append({"role": "user", "content": query})
     return msgs
 
 # ---------- offline library retrieval (v6/2b-i: qdrant semantic search, replaces cross-encoder) ----------
@@ -688,10 +1003,12 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v6 starting: {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v8 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+        "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
     pub.subscribe(on_receive, "meshtastic.receive")
+    pub.subscribe(on_telemetry, "meshtastic.receive.telemetry")   # v7: capture weather telemetry
     pub.subscribe(on_lost, "meshtastic.connection.lost")
     if TCP_HOST:
         iface = meshtastic.tcp_interface.TCPInterface(TCP_HOST, portNumber=TCP_PORT)
