@@ -1,35 +1,63 @@
 # mesh-ai-bridge
 
-A **Meshtastic → local LLM bridge** for off-grid mesh networks. Send `@ai <question>`
-from any node on your mesh and get an answer back over LoRa — generated entirely on
-your own hardware, grounded in an offline reference library, with no internet required.
+Ask your mesh a question from any Meshtastic node — `@ai how do I purify creek water?` —
+and get a real answer back over LoRa, from an LLM running on **your own hardware**,
+grounded in **your offline reference library**. No internet. One container between your
+radio and any OpenAI-compatible endpoint.
 
-Built for [Project NOMAD](https://github.com/aebconsulting), a self-hosted off-grid AI
-+ knowledge base. Runs as a single container; the radio is the only thing it needs.
+```
+!node-42  @ai how do I treat a deep cut with no supplies?
+bridge    (1/2) Apply firm direct pressure with the cleanest cloth you have and
+          hold it. Do not remove a soaked cloth—add more on top. Elevate the limb.
+bridge    (2/2) Keep pressure until bleeding stops. Watch for shock. Source: Where
+          There Is No Doctor, wound care.
+```
 
-## Why this over a minimal bridge
+It chunks replies to LoRa's byte limits, rate-limits itself so it never floods your
+channel, remembers facts you teach it from a handheld, and — when the vector DB or the
+internet isn't there — degrades gracefully instead of going silent.
 
-A basic mesh-LLM bridge forwards a prompt to a model and chunks the reply. This one is
-built to actually be useful when the grid is down:
+## How it compares (honestly)
 
-- **Retrieval-augmented answers.** Every query is embedded and semantically searched
-  against an offline vector library (qdrant) before it reaches the model, so answers are
-  grounded in real reference text — medical guides, repair manuals, survival docs — not
-  just model memory. Sub-second retrieval against a multi-million-chunk index.
-- **Graceful degradation.** If the vector DB or embedder is unreachable, it falls back to
-  keyword search over a Kiwix library, then to the bare model — and logs *which* path it
-  took, so a missing answer is always diagnosable.
-- **Persistent memory.** Per-sender conversation history plus operator-taught facts
-  (`@ai remember <fact>`), stored in SQLite (WAL mode for concurrent dashboard reads).
-- **Dashboard-ready.** A token-gated HTTP send API lets a dashboard transmit *through*
-  the bridge (the bridge is the single radio owner), and every message + node telemetry
-  snapshot is logged to SQLite for a live feed and map.
-- **Built to not drop your message.** A bounded no-drop FIFO queue holds under load
-  rather than shedding, radio retransmits are de-duplicated, and worker/API liveness is
-  exposed on a health endpoint. The only intentional drop is when the LLM itself is
-  unreachable.
-- **LoRa-aware.** Replies are size-chunked to the mesh's byte limits and rate-limited
-  per-node and globally, so one chatty node can't flood the channel.
+There are already several Meshtastic → LLM bridges, and if you just want prompt → reply
+over the mesh, some of them are great and simpler to stand up:
+
+- **[meshing-around](https://github.com/SpudGunMan/meshing-around)** — the community
+  default; huge feature set (BBS mail, weather, EAS alerts, Kiwix RAG, multi-radio).
+- **[MESH-AI / mesh-api](https://github.com/mr-tbot/mesh-api)** — feature-maximalist,
+  many providers, and it ships a full web dashboard + node map.
+- **[SurvivalRAG](https://github.com/bdkoeh/survivalRAG)** — ships a *pre-built* survival/
+  medical RAG corpus, so you don't have to build your own index.
+
+**Where this one is different:** it's a small, container-first, single-purpose bridge for
+people who run (or want to run) **semantic RAG over their *own* corpus**, and it's built
+with reliability engineering the hobby tier usually skips:
+
+- **Answers cite real manuals, not model memory.** Your query is embedded and vector-
+  searched against your offline library (qdrant) before it reaches the model, so answers
+  come from actual medical/repair/survival text you chose — not just what the model
+  happened to memorize.
+- **It still answers when things break.** If the vector DB or embedder is unreachable it
+  falls back to keyword search over a Kiwix library, then to the bare model — and it
+  **logs which path it took**, so a missing answer is diagnosable, not mysterious.
+- **It won't flood your channel.** Replies are byte-chunked to the LoRa limit and rate-
+  limited per-node and globally; one chatty node can't hog airtime.
+- **It holds under load instead of dropping.** A bounded FIFO queue with radio-retransmit
+  de-duplication; worker/API liveness is exposed on a health endpoint.
+- **It owns the radio cleanly.** A token-gated HTTP send API lets a dashboard transmit
+  *through* the bridge (the bridge is the single radio owner), and every message + node
+  telemetry snapshot is logged to SQLite for a feed and map.
+- **You can teach it facts from the field.** `@ai remember The well pump breaker is in the
+  north shed.` — stored forever, injected into future answers.
+
+If your use case is "curated survival answers with zero setup," SurvivalRAG may fit better.
+If you want a kitchen-sink bot, meshing-around does more. This is for when you want *your*
+library, *your* model, and a bridge that stays up.
+
+> **Note:** you supply the offline library. This repo is the bridge, not the corpus — it
+> reads a qdrant collection / Kiwix server you point it at. Building and embedding that
+> library is on you (a curated-corpus tool like SurvivalRAG, or your own ingestion, gets
+> you one).
 
 ## How it works
 
@@ -40,22 +68,33 @@ built to actually be useful when the grid is down:
   handheld ◀──LoRa reply (chunked)──────────────────────────────┘
 ```
 
-The bridge connects to the radio over **serial** (`MESH_SERIAL`) or **TCP**
-(`MESH_TCP_HOST` — for containerized deployments where the radio is exposed via
-ser2net / meshtasticd). It subscribes to inbound text, and for messages starting with
-the trigger prefix (`@ai` by default) it assembles context (library + memory), calls the
-model, and sends the chunked reply back to the sender (DM) or channel.
+Connects to the radio over **serial** (`MESH_SERIAL`) or **TCP** (`MESH_TCP_HOST`, for
+containerized setups where the radio is exposed via ser2net / meshtasticd). For inbound
+text starting with the trigger prefix (`@ai`), it assembles context (library + memory),
+calls the model, and sends the chunked reply back to the sender (DM) or channel.
+
+## ⚠️ Safety
+
+This forwards **AI-generated** text over radio, including for medical, survival, and
+repair questions. LLMs can be confidently wrong, and RAG grounding reduces but does not
+eliminate that. **Do not rely on its output as a substitute for professional medical,
+legal, or safety advice.** Treat every answer as a starting point to verify, not an
+authority — especially in an emergency. Provided "as is" (see LICENSE); you are
+responsible for how you deploy and use it.
 
 ## Requirements
 
 - A Meshtastic radio (serial-attached, or reachable over TCP)
-- An **OpenAI-compatible chat endpoint** — e.g. [Ollama](https://ollama.com),
-  LiteLLM, or any `/v1/chat/completions` server
-- *(optional, for retrieval)* an embeddings endpoint (Ollama `/api/embeddings`) +
-  a [qdrant](https://qdrant.tech) collection of your pre-embedded library
-- *(optional, for keyword fallback)* a [Kiwix](https://kiwix.org) server hosting `.zim` books
+- An **OpenAI-compatible chat endpoint** — e.g. [Ollama](https://ollama.com), LiteLLM,
+  or any `/v1/chat/completions` server
+- Enough compute to run a useful model: a **RAG-grounded answer wants an ~8B+ model**, so
+  in practice a machine with a modern GPU (or an Apple-silicon box). It will run a small
+  model on a Pi-class device, but expect slower, weaker answers.
+- *(optional, for retrieval)* an embeddings endpoint (Ollama `/api/embeddings`) + a
+  [qdrant](https://qdrant.tech) collection of your pre-embedded library
+- *(optional, keyword fallback)* a [Kiwix](https://kiwix.org) server hosting `.zim` books
 
-Only the radio + an LLM endpoint are required; everything else degrades gracefully.
+Only the radio + an LLM endpoint are required; retrieval and fallback degrade gracefully.
 
 ## Quick start (Docker)
 
@@ -74,13 +113,19 @@ docker run -d --name mesh-ai-bridge --restart unless-stopped \
 ```
 
 For serial instead of TCP, drop `MESH_TCP_HOST`, pass `--device` for your radio, and set
-`MESH_SERIAL` to its path.
-
-Run the built-in self-test (checks library retrieval, memory, and the LLM round-trip):
+`MESH_SERIAL`. Smoke-test the stack (memory + LLM round-trip; retrieval is checked if
+configured):
 
 ```bash
 docker run --rm -e LLM_BASE_URL=... mesh-ai-bridge python /app/bridge.py --selftest
 ```
+
+## Reply size
+
+Replies are capped at `MAX_REPLY_CHUNKS` × `CHUNK_BYTES` (default **2 messages × 190
+bytes**) — so answers are roughly **two text messages**, terse by design. LoRa airtime is
+scarce; the system prompt pushes the model to be brief. Raise the caps if your mesh can
+afford the airtime.
 
 ## Configuration
 
@@ -100,42 +145,45 @@ the full annotated list. The essentials:
 | `MAX_REPLY_CHUNKS` / `CHUNK_BYTES` | `2` / `190` | LoRa reply sizing |
 | `NODE_COOLDOWN_S` / `GLOBAL_PER_MIN` | `30` / `6` | Rate limiting |
 | `EMBED_URL` / `EMBED_MODEL` | Ollama / `nomic-embed-text` | Query embeddings (retrieval) |
-| `QDRANT_URL` / `QDRANT_COLLECTION` | — | Vector library (retrieval) |
+| `QDRANT_URL` / `QDRANT_COLLECTION` | `qdrant:6333` / `knowledge_base` | Vector library (retrieval) |
 | `KIWIX_URL` / `LIBRARY_BOOKS` | — | Offline library (keyword fallback) |
 | `SEND_TOKEN` / `SEND_PORT` | _(off)_ / `8700` | Dashboard send API (disabled if no token) |
 | `MEM_DB` | `/opt/mesh-ai-bridge/memory.db` | SQLite memory + logs |
 
-## Operator commands
+## Teach it facts from a handheld
 
-Nodes listed in `ADMIN_NODES` can teach the assistant durable facts:
+Nodes listed in `ADMIN_NODES` can give the bridge durable, shared knowledge that's injected
+into every future answer:
 
 - `@ai remember The well pump breaker is in the north shed.`
 - `@ai forget well pump`
 
-Facts are injected into the context of every future answer.
+Facts are operator-taught and shared to everyone on the mesh (intended for common
+reference like locations and procedures), not per-user private notes.
 
-## Dashboard integration
+## Connecting a dashboard / UI
 
-With `SEND_TOKEN` set, the bridge exposes a small HTTP API on `SEND_PORT` (bind it to a
-private network only — it is not meant to face the internet):
+The bridge doesn't ship a UI, but it exposes everything one needs:
 
-- `POST /api/send` — `{"text": "...", "channel": 0}` or `{"text": "...", "to": "!abcd1234"}`,
-  header `X-Send-Token: <token>`. Transmits through the bridge (the single radio owner).
-- `GET /api/health` — radio/API/worker liveness, queue depth, worker idle time.
+- **`POST /api/send`** (token-gated) — `{"text": "...", "channel": 0}` or `{"text": "...",
+  "to": "!abcd1234"}` with header `X-Send-Token: <token>`. Transmits through the bridge
+  (the single radio owner), so a dashboard doesn't need its own radio connection.
+- **`GET /api/health`** — radio/API/worker liveness, queue depth, worker idle time.
+- **`msg_log`** and **`nodes`** tables in `MEM_DB` — a live message feed and node
+  map/telemetry. Open the DB **read-only**; WAL mode keeps reads from blocking the bridge.
 
-The `msg_log` and `nodes` tables in `MEM_DB` give a dashboard a live message feed and a
-node map/telemetry view (open the DB read-only; WAL mode keeps reads from blocking the
-bridge's writes).
+Bind `SEND_PORT` to a private/container network only — it is not meant to face the internet.
 
 ## Security notes
 
 - The send API is **token-gated** (constant-time compare) and **disabled** unless
-  `SEND_TOKEN` is set. Bind `SEND_PORT` to a private/container network, never the public
-  internet or a shared LAN.
-- Only `ADMIN_NODES` can write facts; all other memory-write attempts are refused and logged.
+  `SEND_TOKEN` is set. `GET /api/health` is unauthenticated (returns node name + queue
+  internals), so keep `SEND_PORT` off any shared/public network.
+- Only `ADMIN_NODES` can write facts; other memory-write attempts are refused and logged.
 - The bridge holds a **single** radio connection. Don't run a second Meshtastic client
   against the same radio — route dashboard sends through `/api/send` instead.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Free to use, modify, and redistribute. Part of a larger
+self-hosted off-grid AI system (Project NOMAD); this bridge stands alone.

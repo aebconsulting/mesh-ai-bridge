@@ -388,6 +388,15 @@ def dashboard_allowed_now(key="dashboard"):
         _dash_last[key] = now
         return True
 
+def _byte_prefix(s, max_bytes):
+    """Longest prefix of s that fits in max_bytes UTF-8 bytes, without splitting a character.
+    CHUNK is a *byte* budget (LoRa payload limit) but slicing by character can overflow it on
+    any multibyte content (a degree sign, an accent), so all trimming goes through here."""
+    b = s.encode()
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", "ignore")
+
 def chunk_reply(text):
     if not text:
         return []
@@ -396,13 +405,15 @@ def chunk_reply(text):
         if len(text.encode()) <= CHUNK:
             chunks.append(text)
             break
-        cut = text[:CHUNK]
+        cut = _byte_prefix(text, CHUNK)                 # byte-bounded, not char-bounded
         m = re.search(r"^.*[.!?]\s", cut, re.S)
-        piece = (m.group(0) if m and len(m.group(0)) > CHUNK // 3 else cut).rstrip()
+        piece = (m.group(0) if m and len(m.group(0)) > CHUNK // 3 else cut).rstrip() or cut
         chunks.append(piece)
         text = text[len(piece):].lstrip()
     if text and len(chunks) == MAX_CHUNKS:
-        chunks[-1] = chunks[-1][:CHUNK - 2].rstrip() + " ..."
+        # Reserve 4 bytes for " ..." so the final chunk still fits the budget (the old
+        # CHUNK-2 slice + 4-byte suffix overflowed by 2 bytes even in pure ASCII).
+        chunks[-1] = _byte_prefix(chunks[-1], CHUNK - 4).rstrip() + " ..."
     return chunks
 
 # ---------- dashboard send API (v6) ----------
