@@ -181,6 +181,11 @@ reference like locations and procedures), not per-user private notes.
 
 ## Connecting a dashboard / UI
 
+> **Companion:** [**NOMAD Mesh Dashboard**](https://github.com/aebconsulting/nomad-mesh-dashboard)
+> is a ready-made, offline-first web UI for exactly this — a live feed + send box, a
+> MapLibre node map, a sortable telemetry table, a combined log, and a per-node detail
+> view. It reads the bridge DB read-only and sends through `/api/send`. Or build your own.
+
 The bridge doesn't ship a UI, but it exposes everything one needs:
 
 - **`POST /api/send`** (token-gated) — `{"text": "...", "channel": 0}` or `{"text": "...",
