@@ -636,17 +636,17 @@ def test_worker_processes_queued_item():
     calls = []
     evt = threading.Event()
 
-    def fake_handle_query(sender, ch, query, send):
-        calls.append((sender, ch, query, send))
+    def fake_handle_query(sender, ch, query, send, is_dm=False):
+        calls.append((sender, ch, query, send, is_dm))
         evt.set()
 
     bridge.handle_query = fake_handle_query
     send = lambda c: None
     try:
-        bridge.work_q.put(("!node1", 0, "hello", send))
+        bridge.work_q.put(("!node1", 0, "hello", send, False))
         bridge.start_worker()
         assert evt.wait(timeout=5), "worker did not process the queued item in time"
-        assert calls == [("!node1", 0, "hello", send)], "handle_query must receive the exact queued args"
+        assert calls == [("!node1", 0, "hello", send, False)], "handle_query must receive the exact queued args"
     finally:
         bridge.handle_query = orig_hq
         bridge.work_q = orig_wq
@@ -661,10 +661,10 @@ def test_worker_survives_handler_exception():
     calls = []
     evt = threading.Event()
 
-    def fake_handle_query(sender, ch, query, send):
+    def fake_handle_query(sender, ch, query, send, is_dm=False):
         if query == "boom":
             raise RuntimeError("handler blew up")
-        calls.append((sender, ch, query, send))
+        calls.append((sender, ch, query, send, is_dm))
         evt.set()
 
     bridge.handle_query = fake_handle_query
@@ -673,11 +673,11 @@ def test_worker_survives_handler_exception():
     send = lambda c: None
     try:
         bridge.log = lambda *a: logs.append(" ".join(str(x) for x in a))
-        bridge.work_q.put(("!node1", 0, "boom", send))
-        bridge.work_q.put(("!node1", 0, "second", send))
+        bridge.work_q.put(("!node1", 0, "boom", send, False))
+        bridge.work_q.put(("!node1", 0, "second", send, False))
         bridge.start_worker()
         assert evt.wait(timeout=5), "worker must still process the item AFTER the exception"
-        assert calls == [("!node1", 0, "second", send)], "the second item must reach handle_query"
+        assert calls == [("!node1", 0, "second", send, False)], "the second item must reach handle_query"
         assert any("worker error" in l for l in logs), "the exception must be logged, not silently swallowed"
     finally:
         bridge.handle_query = orig_hq
@@ -694,7 +694,7 @@ def test_health_includes_queue_fields():
     bridge.work_q = queue.Queue(maxsize=100)   # fresh queue, no worker draining it
     try:
         for i in range(3):
-            bridge.work_q.put(("!n", 0, "q{}".format(i), lambda c: None))
+            bridge.work_q.put(("!n", 0, "q{}".format(i), lambda c: None, False))
         if not bridge.send_api_alive:
             bridge.SEND_TOKEN = bridge.SEND_TOKEN or "testtoken123"
             bridge.start_send_api()
@@ -815,7 +815,7 @@ def test_enqueue_does_not_drop():
     proc_lock = threading.Lock()
     done_evt = threading.Event()
 
-    def fake_handle_query(sender, ch, query, send):
+    def fake_handle_query(sender, ch, query, send, is_dm=False):
         time.sleep(0.02)   # simulate real work so the small queue actually fills and blocks producers
         with proc_lock:
             processed.append(query)
@@ -828,7 +828,7 @@ def test_enqueue_does_not_drop():
         bridge.start_worker()
         for i in range(N):
             # Same enqueue path as on_receive: a BLOCKING put - holds if full, never drops.
-            bridge.work_q.put(("!node1", 0, "q{}".format(i), send))
+            bridge.work_q.put(("!node1", 0, "q{}".format(i), send, False))
         assert done_evt.wait(timeout=10), "not all items were processed in time"
         assert len(processed) == N, "no-drop: every enqueued item must be processed exactly once"
         assert sorted(processed) == sorted("q{}".format(i) for i in range(N)), \
