@@ -47,6 +47,20 @@ with reliability engineering the hobby tier usually skips:
 - **It owns the radio cleanly.** A token-gated HTTP send API lets a dashboard transmit
   *through* the bridge (the bridge is the single radio owner), and every message + node
   telemetry snapshot is logged to SQLite for a feed and map.
+- **It tells you whether a message actually went anywhere.** Every send requests an ACK
+  and a `ROUTING_APP` co-subscriber correlates them back per message: DMs upgrade to an
+  end-to-end *acknowledged*, broadcasts to *relayed by a neighbor*, failures carry the
+  radio's reason. States only ever upgrade — an early local ACK can't mask a lost DM —
+  and the vocabulary never claims "delivered": a radio ACK is not a human receipt.
+- **Replies and reactions are first-class.** The send API takes `reply_id` for quoted
+  Discord-style replies and `react` for emoji tapbacks (hand-built packet — the Python
+  API exposes `reply_id` but not the `emoji` flag), inbound reply targets and tapbacks
+  are logged so a UI can thread and chip them, and the AI's answers quote the question
+  they answer. A 👍 aimed at the AI never burns an LLM slot.
+- **It collects everything the mesh says about itself.** Device metrics, environment
+  sensors, power telemetry, GPS quality, and neighbor links all land in queryable SQLite
+  tables alongside the message log — enough to drive a live map, per-node detail views,
+  and mesh-weather answers with zero extra services.
 - **You can teach it facts from the field.** `@ai remember The well pump breaker is in the
   north shed.` — stored forever, injected into future answers.
 

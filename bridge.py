@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v8 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v12 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v12 adds replies & reactions: msg_log stores every message's mesh packet id, reply target
+(reply_to_id) and tapback flag (is_reaction); the send API accepts reply_id (quoted reply)
+and react (emoji tapback via hand-built packet — no public API sets Data.emoji); @ai answers
+quote the question on their first chunk. Additive only.
+
+v9 adds "collect it all": full per-node metadata (hw model/role, GPS altitude/fix source,
+device health, RF path), a general telemetry EAV table capturing every numeric metric from
+every telemetry group (device/env/power/air-quality/etc.), and a neighbors table recording
+NEIGHBORINFO links for a mesh topology view. Purely additive - no change to radio TX, the
+send API, the query queue, or existing text handling.
 
 v8 adds NET_BACKUP: when the host happens to have internet, live-data questions (weather/
 forecast) are answered with real current conditions from keyless public APIs (Open-Meteo +
@@ -25,6 +36,7 @@ from pubsub import pub
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
+from meshtastic.protobuf import mesh_pb2, portnums_pb2
 
 SERIAL = os.environ.get("MESH_SERIAL", "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0")
 # MESH_TCP_HOST set -> connect to the radio over TCP (ser2net or meshtasticd) instead of
@@ -76,6 +88,7 @@ QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "100"))
 DEDUP_TTL_S = int(os.environ.get("DEDUP_TTL_S", "120"))
 # v7: environmental telemetry -> "current local weather" from mesh sensor nodes.
 ENV_WINDOW_S = int(os.environ.get("ENV_WINDOW_S", "3600"))   # only readings this fresh count as "current"
+DIRECT_NEIGHBOR_THROTTLE_S = int(os.environ.get("DIRECT_NEIGHBOR_THROTTLE_S", "300"))  # v10: min gap between recorded base->direct-neighbor samples
 ENV_TEMP_UNIT = os.environ.get("ENV_TEMP_UNIT", "F").upper()  # Meshtastic reports Celsius; display F (US) or C
 # v8: internet backup for live-data queries. Keyless APIs only (Open-Meteo, zippopotam.us) -
 # nothing to configure or leak. Default OFF so the public image stays offline-first.
@@ -129,14 +142,49 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS env_log(id INTEGER PRIMARY KEY, ts REAL, node_id TEXT, "
               "node_name TEXT, temperature REAL, humidity REAL, pressure REAL, lat REAL, lon REAL)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_env_log_ts ON env_log(ts)")
+
+    def _add_cols(c, table, cols):
+        have = {r[1] for r in c.execute("PRAGMA table_info({})".format(table))}
+        for name, decl in cols:
+            if name not in have:
+                try:
+                    c.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, name, decl))
+                except sqlite3.OperationalError as e:
+                    # First-deploy TOCTOU: another connection may have added this column
+                    # between our table_info read and here. A "duplicate column name"
+                    # means the column now exists (self-heals); anything else re-raises.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
+
+    # v9: "collect it all" - extra per-node metadata Meshtastic exposes but the bridge
+    # previously discarded (hw model/role, GPS altitude/fix source, device health, RF path).
+    _add_cols(c, "nodes", [
+        ("hw_model", "TEXT"), ("role", "TEXT"), ("altitude", "REAL"), ("voltage", "REAL"),
+        ("chan_util", "REAL"), ("air_util_tx", "REAL"), ("uptime_s", "INTEGER"),
+        ("rssi", "REAL"), ("via_mqtt", "INTEGER"), ("sats", "INTEGER"), ("loc_source", "TEXT"),
+    ])
+    # v9: general telemetry (EAV) — every numeric metric from every telemetry packet.
+    c.execute("CREATE TABLE IF NOT EXISTS telemetry(id INTEGER PRIMARY KEY, ts REAL, node_id TEXT, node_name TEXT, kind TEXT, metric TEXT, value REAL)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry(ts)")
+    # v9: neighbor links (who each node hears directly) — for a mesh topology view.
+    c.execute("CREATE TABLE IF NOT EXISTS neighbors(id INTEGER PRIMARY KEY, ts REAL, node_id TEXT, neighbor_id TEXT, snr REAL)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_neighbors_ts ON neighbors(ts)")
+    # v11/5a: per-message delivery tracking — outbound packet id + ACK/NAK state.
+    _add_cols(c, "msg_log", [("mesh_id", "INTEGER"), ("ack_state", "TEXT")])
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_log_mesh_id ON msg_log(mesh_id)")
+    # v12/6a: reply threading + emoji tapbacks
+    _add_cols(c, "msg_log", [("reply_to_id", "INTEGER"), ("is_reaction", "INTEGER")])
+    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_log_reply_to ON msg_log(reply_to_id)")
     return c
 
-def log_traffic(direction, node_id, node_name, channel, is_dm, is_ai, text):
+def log_traffic(direction, node_id, node_name, channel, is_dm, is_ai, text, mesh_id=None, ack_state=None,
+                reply_to_id=None, is_reaction=None):
     try:
         with db() as c:
-            c.execute("INSERT INTO msg_log(ts, direction, node_id, node_name, channel, is_dm, is_ai, text) "
-                      "VALUES(?,?,?,?,?,?,?,?)",
-                      (time.time(), direction, node_id, node_name, channel, int(is_dm), int(is_ai), text))
+            c.execute("INSERT INTO msg_log(ts, direction, node_id, node_name, channel, is_dm, is_ai, text, "
+                      "mesh_id, ack_state, reply_to_id, is_reaction) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (time.time(), direction, node_id, node_name, channel, int(is_dm), int(is_ai), text,
+                       mesh_id, ack_state, reply_to_id, is_reaction))
     except Exception as e:
         log("msg_log write failed: {}".format(e))
 
@@ -147,30 +195,52 @@ def snapshot_nodes(interface):
             u = n.get("user", {}) or {}
             p = n.get("position", {}) or {}
             m = n.get("deviceMetrics", {}) or {}
+            hw_model = u.get("hwModel")
+            role = u.get("role")
+            loc_source = p.get("locationSource")
+            via_mqtt = n.get("viaMqtt")
             rows.append((nid, u.get("shortName"), u.get("longName"), p.get("latitude"), p.get("longitude"),
-                         m.get("batteryLevel"), n.get("snr"), n.get("hopsAway"), n.get("lastHeard"), time.time()))
+                         m.get("batteryLevel"), n.get("snr"), n.get("hopsAway"), n.get("lastHeard"), time.time(),
+                         str(hw_model) if hw_model is not None else None,
+                         str(role) if role is not None else None,
+                         p.get("altitude"), m.get("voltage"), m.get("channelUtilization"), m.get("airUtilTx"),
+                         m.get("uptimeSeconds"), n.get("rssi"),
+                         int(bool(via_mqtt)) if via_mqtt is not None else None,
+                         p.get("satsInView"),
+                         str(loc_source) if loc_source is not None else None))
         with db() as c:
             c.executemany("INSERT INTO nodes(node_id, short_name, long_name, lat, lon, battery, snr, hops, "
-                          "last_heard, updated) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                          "last_heard, updated, hw_model, role, altitude, voltage, chan_util, air_util_tx, "
+                          "uptime_s, rssi, via_mqtt, sats, loc_source) "
+                          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                           "ON CONFLICT(node_id) DO UPDATE SET short_name=excluded.short_name, "
                           "long_name=excluded.long_name, lat=excluded.lat, lon=excluded.lon, "
                           "battery=excluded.battery, snr=excluded.snr, hops=excluded.hops, "
-                          "last_heard=excluded.last_heard, updated=excluded.updated", rows)
+                          "last_heard=excluded.last_heard, updated=excluded.updated, "
+                          "hw_model=excluded.hw_model, role=excluded.role, altitude=excluded.altitude, "
+                          "voltage=excluded.voltage, chan_util=excluded.chan_util, "
+                          "air_util_tx=excluded.air_util_tx, uptime_s=excluded.uptime_s, "
+                          "rssi=excluded.rssi, via_mqtt=excluded.via_mqtt, sats=excluded.sats, "
+                          "loc_source=excluded.loc_source", rows)
         return len(rows)
     except Exception as e:
         log("node snapshot failed: {}".format(e))
         return 0
 
 def prune_msg_log():
-    """v6/v7: msg_log + env_log share memory.db with the AI memory (backed up nightly) - cap
-    growth. Returns True on success, False on failure so the caller can retry (A3)."""
+    """v6/v7/v9: msg_log + env_log + telemetry + neighbors share memory.db with the AI memory
+    (backed up nightly) - cap growth. Returns True on success, False on failure so the caller
+    can retry (A3)."""
     try:
         with db() as c:
             cutoff = time.time() - RETENTION_DAYS * 86400
             n = c.execute("DELETE FROM msg_log WHERE ts < ?", (cutoff,)).rowcount
             e = c.execute("DELETE FROM env_log WHERE ts < ?", (cutoff,)).rowcount
-        if n or e:
-            log("pruned msg_log {} / env_log {} rows older than {}d".format(n, e, RETENTION_DAYS))
+            t = c.execute("DELETE FROM telemetry WHERE ts < ?", (cutoff,)).rowcount
+            b = c.execute("DELETE FROM neighbors WHERE ts < ?", (cutoff,)).rowcount
+        if n or e or t or b:
+            log("pruned msg_log {} / env_log {} / telemetry {} / neighbors {} rows older than {}d".format(
+                n, e, t, b, RETENTION_DAYS))
         return True
     except Exception as e:
         log("prune failed: {}".format(e))
@@ -197,20 +267,47 @@ def log_env(node_id, node_name, temp, humidity, pressure, lat, lon):
     except Exception as e:
         log("env_log write failed: {}".format(e))
 
+_TELEMETRY_GROUPS = ("deviceMetrics", "environmentMetrics", "powerMetrics", "airQualityMetrics", "localStats", "healthMetrics")
+
+def store_telemetry(node_id, node_name, tele):
+    """v9: record every numeric metric from any telemetry group into the EAV telemetry table."""
+    rows = []
+    now = time.time()
+    for kind in _TELEMETRY_GROUPS:
+        grp = tele.get(kind) or {}
+        if not isinstance(grp, dict):
+            continue
+        for metric, value in grp.items():
+            if isinstance(value, bool):     # bools sneak in as ints — skip flags
+                continue
+            if isinstance(value, (int, float)):
+                rows.append((now, node_id, node_name, kind, metric, float(value)))
+    if not rows:
+        return
+    try:
+        with db() as c:
+            c.executemany("INSERT INTO telemetry(ts, node_id, node_name, kind, metric, value) VALUES(?,?,?,?,?,?)", rows)
+    except Exception as e:
+        log("telemetry write failed: {}".format(e))
+
 def on_telemetry(packet=None, interface=None):
     """Subscribed to meshtastic.receive.telemetry. Extracts environmentMetrics (temp/humidity/
-    pressure) and records them; ignores device-only telemetry. Never raises out (a telemetry
-    handler error must not affect text handling)."""
+    pressure) and records them; ignores device-only telemetry. ADDITIONALLY (v9) records every
+    numeric metric from every telemetry group (device/env/power/air-quality/etc.) into the
+    general telemetry EAV table. Never raises out (a telemetry handler error must not affect
+    text handling)."""
     try:
-        env = ((packet or {}).get("decoded", {}).get("telemetry", {}) or {}).get("environmentMetrics") or {}
-        if not env:
-            return
-        sender = packet.get("fromId") or hex(packet.get("from", 0))
-        n = (getattr(interface, "nodes", None) or {}).get(sender, {}) or {}
-        p = n.get("position", {}) or {}
-        log_env(sender, node_display(interface, sender),
-                env.get("temperature"), env.get("relativeHumidity"), env.get("barometricPressure"),
-                p.get("latitude"), p.get("longitude"))
+        tele = (packet or {}).get("decoded", {}).get("telemetry", {}) or {}
+        env = tele.get("environmentMetrics") or {}
+        sender = packet.get("fromId") or "!{:08x}".format(packet.get("from", 0))
+        node_name = node_display(interface, sender)
+        if env:
+            n = (getattr(interface, "nodes", None) or {}).get(sender, {}) or {}
+            p = n.get("position", {}) or {}
+            log_env(sender, node_name,
+                    env.get("temperature"), env.get("relativeHumidity"), env.get("barometricPressure"),
+                    p.get("latitude"), p.get("longitude"))
+        store_telemetry(sender, node_name, tele)
     except Exception as e:
         log("telemetry handler error: {}".format(e))
 
@@ -757,6 +854,102 @@ def mark_more(chunks):
 # Token-gated HTTP endpoint so the dashboard can transmit THROUGH the bridge
 # (bridge is the single radio owner). Port is NOT published to the LAN -
 # reachable only on the Docker network. Empty SEND_TOKEN disables the API.
+def ack_state_for(error_reason, from_num, dest_num, my_num, is_dm):
+    """Map a ROUTING_APP packet's fields to an ack_state token. Pure — no I/O.
+    error_reason: routing.errorReason; None/""/"NONE" == success (live probe
+    2026-07-12 showed success ACKs carry the STRING "NONE" on this firmware).
+    DM: success from the destination = 'ack' (end-to-end); from our own node =
+    'radio-accepted' (transmit-level only); from any other node (an intermediate
+    relayer) = 'relayed' (progressed into the mesh, not delivered). Broadcast
+    success = 'relayed' (a neighbor rebroadcast, NOT delivery). ACKs are
+    unauthenticated RF: display-only, never automation."""
+    if error_reason and str(error_reason).upper() not in ("NONE", ""):
+        return "failed:{}".format(error_reason)
+    if not is_dm:
+        return "relayed"
+    if dest_num is not None and from_num == dest_num:
+        return "ack"
+    if my_num is not None and from_num == my_num:
+        return "radio-accepted"
+    return "relayed"
+
+# Delivery-state ranking: a ROUTING packet may only UPGRADE a row (a multi-hop
+# DM's local/relay ack arrives BEFORE the destination's end-to-end ack — first-
+# write-wins would lock the weaker state and orphan the definitive one).
+# 'ack' and 'failed:*' are terminal.
+_ACK_RANK = {None: 0, "radio-accepted": 1, "relayed": 2, "ack": 3}
+
+def ack_rank(state):
+    if state and str(state).startswith("failed"):
+        return 3
+    return _ACK_RANK.get(state, 0)
+
+# Display-only health counters. Mutated with += from multiple threads without a
+# lock: CPython += can drop an increment under contention, which is acceptable
+# here — they are monotonic diagnostics that drive no automation.
+sends_without_id = 0
+acks_seen = acks_matched = ack_orphans = ack_db_errors = 0
+last_ack_ts = 0.0
+_ack_confirmed = False   # one-shot loud confirmation ACK tracking works on this mesh
+
+def _send_tapback(interface, text, reply_id, destinationId=None, channelIndex=0):
+    """Send an emoji tapback. meshtastic 2.7.10 has NO public API for the Data
+    `emoji` flag (sendData sets reply_id but never emoji — verified 2026-07-13),
+    so this replicates sendData's packet assembly exactly, plus emoji=1.
+    Returns the sent packet (id populated) — same contract _send_and_log expects."""
+    pkt = mesh_pb2.MeshPacket()
+    pkt.channel = channelIndex
+    pkt.decoded.payload = text.encode("utf-8")
+    pkt.decoded.portnum = portnums_pb2.PortNum.TEXT_MESSAGE_APP
+    pkt.decoded.want_response = False
+    pkt.id = interface._generatePacketId()
+    pkt.decoded.reply_id = reply_id
+    pkt.decoded.emoji = 1
+    pkt.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+    return interface._sendPacket(pkt, destinationId=destinationId or "^all", wantAck=True)
+
+def _send_and_log(send_fn, node_id, node_name, ch, is_dm, is_ai, text, reply_to_id=None, is_reaction=None):
+    """Three phases that must not cross-contaminate: (1) radio send — a raise
+    here is a REAL send failure, recorded as a 'failed' row and re-raised;
+    (2) id extraction — can NEVER turn a successful send into a failure; a
+    missing id means a permanently glyphless row, counted; (3) log —
+    log_traffic never raises. Deliberate tradeoff: send-then-log means a crash
+    in the ms between TX and log loses the row; the inverse (log-then-send)
+    records phantom sends that never hit RF — the worse lie on a life-safety
+    mesh (operator believes help was called)."""
+    global sends_without_id
+    try:
+        pkt = send_fn()
+    except Exception:
+        log_traffic("out", node_id, node_name, ch, is_dm, is_ai, text, mesh_id=None, ack_state="failed",
+                    reply_to_id=reply_to_id, is_reaction=is_reaction)
+        raise
+    # protobuf scalar .id defaults to 0 (never None/AttributeError) — 0 == no id.
+    mesh_id = getattr(pkt, "id", 0) or None
+    if mesh_id is None:
+        sends_without_id += 1
+        log("send returned no packet id — row will stay glyphless")
+    log_traffic("out", node_id, node_name, ch, is_dm, is_ai, text, mesh_id=mesh_id, ack_state=None,
+                reply_to_id=reply_to_id, is_reaction=is_reaction)
+    return pkt
+
+def _validate_reply_fields(data, text):
+    """Validate the optional reply/react send fields. Returns (error, reply_id, react).
+    reply_id: mesh packet id being replied/reacted to, 1..0xFFFFFFFF.
+    react: emoji tapback — requires reply_id, text capped at 8 bytes (an emoji)."""
+    reply_id = data.get("reply_id")
+    react = data.get("react", False)
+    if reply_id is not None:
+        if isinstance(reply_id, bool) or not isinstance(reply_id, int) or not (1 <= reply_id <= 0xFFFFFFFF):
+            return "reply_id must be an integer 1..4294967295", None, False
+    if react is not False and react is not True:
+        return "react must be a boolean", None, False
+    if react and reply_id is None:
+        return "react requires reply_id", None, False
+    if react and len(text.encode()) > 8:
+        return "a reaction is a single emoji (max 8 bytes)", None, False
+    return None, reply_id, react
+
 class SendHandler(BaseHTTPRequestHandler):
     timeout = 10  # v6/A4: cap slowloris-style connections that dribble/withhold bytes
 
@@ -782,7 +975,11 @@ class SendHandler(BaseHTTPRequestHandler):
             log("health check: getMyNodeInfo failed: {}".format(e))
         self._reply(200, {"ok": iface is not None and node_info_ok, "node": node,
                           "api": send_api_alive, "queue_depth": work_q.qsize(), "worker": worker_alive,
-                          "worker_idle_s": round(time.time() - last_progress_ts, 1)})
+                          "worker_idle_s": round(time.time() - last_progress_ts, 1),
+                          "acks_seen": acks_seen, "acks_matched": acks_matched,
+                          "ack_orphans": ack_orphans, "ack_db_errors": ack_db_errors,
+                          "sends_without_id": sends_without_id,
+                          "last_ack_ts": last_ack_ts or None})
 
     def do_POST(self):
         if self.path != "/api/send":
@@ -811,21 +1008,36 @@ class SendHandler(BaseHTTPRequestHandler):
             return self._reply(400, {"error": "bad destination"})
         if not isinstance(ch, int) or (to is None and ch not in ALLOWED):
             return self._reply(400, {"error": "channel not allowed"})
+        err, reply_id, react = _validate_reply_fields(data, text)
+        if err:
+            return self._reply(400, {"error": err})
         if not dashboard_allowed_now():
             return self._reply(429, {"error": "rate limited"})
         if iface is None:
             return self._reply(503, {"error": "radio not connected"})
         try:
-            if to:
-                iface.sendText(text, destinationId=to)
-                log_traffic("out", to, node_display(iface, to), ch, True, False, text)
+            # 5a: wantAck=True is the OWNED TX change — operator sends now request a
+            # delivery ACK (destination transmits an ack; firmware retransmits <=3x).
+            if react:
+                if to:
+                    pkt = _send_and_log(lambda: _send_tapback(iface, text, reply_id, destinationId=to),
+                                        to, node_display(iface, to), ch, True, False, text,
+                                        reply_to_id=reply_id, is_reaction=1)
+                else:
+                    pkt = _send_and_log(lambda: _send_tapback(iface, text, reply_id, channelIndex=ch),
+                                        "dashboard", "Dashboard", ch, False, False, text,
+                                        reply_to_id=reply_id, is_reaction=1)
+            elif to:
+                pkt = _send_and_log(lambda: iface.sendText(text, destinationId=to, wantAck=True, replyId=reply_id),
+                                    to, node_display(iface, to), ch, True, False, text, reply_to_id=reply_id)
             else:
-                iface.sendText(text, channelIndex=ch)
-                log_traffic("out", "dashboard", "Dashboard", ch, False, False, text)
+                pkt = _send_and_log(lambda: iface.sendText(text, channelIndex=ch, wantAck=True, replyId=reply_id),
+                                    "dashboard", "Dashboard", ch, False, False, text, reply_to_id=reply_id)
         except Exception as e:
             log("sendapi radio send failed: {}".format(e))
             return self._reply(502, {"error": "radio send failed"})
-        log("sendapi TX {} {}B: {}".format("dm " + to if to else "ch{}".format(ch), len(text.encode()), repr(text)))
+        log("sendapi TX {} {}B id={}: {}".format("dm " + to if to else "ch{}".format(ch),
+            len(text.encode()), getattr(pkt, "id", None), repr(text)))
         self._reply(200, {"ok": True})
 
 def start_send_api():
@@ -959,6 +1171,26 @@ def _send_chunks(chunks, send):
         log("reply {} ({}B): {}".format(i + 1, len(c.encode()), repr(c)))
         time.sleep(CHUNK_DELAY_S)
 
+def _inbound_meta(packet, dec):
+    """Pull (mesh_id, reply_to_id, is_reaction) from an inbound packet dict.
+    Protobuf-dict defaults are OMITTED: replyId/emoji are absent on normal
+    messages. is_reaction is 1 or None (never 0) to keep NULL semantics."""
+    mesh_id = packet.get("id") or None
+    reply_to = dec.get("replyId") or None
+    reacted = 1 if dec.get("emoji") else None
+    return mesh_id, reply_to, reacted
+
+def make_quoted_send(send_raw, quote_id):
+    """Wrap a two-arg send(chunk, rid) into the one-arg send(chunk) the worker
+    uses, quoting quote_id on the FIRST call only — the @ai answer's first
+    chunk renders attached to the question; continuations stay plain."""
+    state = {"first": True}
+    def send(c):
+        rid = quote_id if state["first"] else None
+        state["first"] = False
+        return send_raw(c, rid)
+    return send
+
 def on_receive(packet=None, interface=None):
     try:
         dec = (packet or {}).get("decoded", {})
@@ -968,12 +1200,16 @@ def on_receive(packet=None, interface=None):
             return
         ch = packet.get("channel", 0)
         text = dec.get("text", "").strip()
-        sender = packet.get("fromId") or hex(packet.get("from", 0))
+        sender = packet.get("fromId") or "!{:08x}".format(packet.get("from", 0))
         is_dm = packet.get("to") == my_num
         is_ai = text.lower().startswith(PREFIX)
         node_name = node_display(interface, sender)
+        mesh_id, reply_to_id, is_reaction = _inbound_meta(packet, dec)
         # Log ALL inbound mesh text (the dashboard feed), not just @ai queries.
-        log_traffic("in", sender, node_name, ch, is_dm, is_ai, text)
+        log_traffic("in", sender, node_name, ch, is_dm, is_ai, text,
+                    mesh_id=mesh_id, reply_to_id=reply_to_id, is_reaction=is_reaction)
+        if is_reaction:
+            return   # a tapback is never a query — logged flagged, nothing else
         if not is_ai:
             return
         query = text[len(PREFIX):].strip()
@@ -981,15 +1217,18 @@ def on_receive(packet=None, interface=None):
             # Direct message to the AI node: reply privately to the sender. wantAck=True gets
             # firmware-level retransmits (up to 3) if the sender doesn't confirm receipt —
             # fire-and-forget DMs silently lost chunk 2 of multi-chunk replies on a busy mesh.
-            send = lambda c: (log_traffic("out", sender, node_name, ch, True, True, c),
-                              interface.sendText(c, destinationId=sender, wantAck=True))[1]
+            send_raw = lambda c, rid=None: _send_and_log(
+                lambda: interface.sendText(c, destinationId=sender, wantAck=True, replyId=rid),
+                sender, node_name, ch, True, True, c, reply_to_id=rid)
         else:
             if ch not in ALLOWED:
                 return
             # Broadcast wantAck uses the implicit-ack (a neighbor rebroadcasting counts);
             # firmware retransmits if nobody is heard repeating it.
-            send = lambda c: (log_traffic("out", sender, node_name, ch, False, True, c),
-                              interface.sendText(c, channelIndex=ch, wantAck=True))[1]
+            send_raw = lambda c, rid=None: _send_and_log(
+                lambda: interface.sendText(c, channelIndex=ch, wantAck=True, replyId=rid),
+                sender, node_name, ch, False, True, c, reply_to_id=rid)
+        send = make_quoted_send(send_raw, mesh_id)
         if not query:
             return
         # DEDUP BEFORE the rate-limit (C1): a radio retransmit must not burn a rate slot or
@@ -1017,6 +1256,61 @@ def on_receive(packet=None, interface=None):
     except Exception as e:
         log("handler error: {}".format(e))
 
+def on_neighbor(packet=None, interface=None):
+    """v9: capture NEIGHBORINFO packets into the neighbors table. Fully isolated —
+    a failure here must never affect text handling (co-subscriber to on_receive)."""
+    try:
+        dec = (packet or {}).get("decoded", {}) or {}
+        if dec.get("portnum") != "NEIGHBORINFO_APP":
+            return
+        ni = dec.get("neighborinfo") or {}
+        node_id = packet.get("fromId") or ("!{:08x}".format(packet.get("from", 0)))
+        rows = []
+        now = time.time()
+        for nb in (ni.get("neighbors") or []):
+            num = nb.get("nodeId")
+            if num is None:
+                continue
+            nbid = num if isinstance(num, str) else "!{:08x}".format(int(num))
+            rows.append((now, node_id, nbid, nb.get("snr")))
+        if not rows:
+            return
+        with db() as c:
+            c.executemany("INSERT INTO neighbors(ts, node_id, neighbor_id, snr) VALUES(?,?,?,?)", rows)
+    except Exception as e:
+        log("neighbor handler error: {}".format(e))
+
+_direct_seen = {}  # sender node_id -> last ts a direct-link sample was recorded (throttle)
+
+def on_direct_neighbor(packet=None, interface=None):
+    """v10: derive the BASE's direct RF neighbors from received traffic. A packet whose
+    hopStart == hopLimit reached us with no rebroadcast, so its sender is a direct neighbor;
+    record a base->sender edge (rxSnr) into the same neighbors table the NEIGHBORINFO path
+    feeds, throttled per sender. Fully isolated (co-subscriber to on_receive) so it can never
+    disturb text handling."""
+    try:
+        if my_num is None:
+            return
+        frm = packet.get("from")
+        if frm is None or frm == my_num:
+            return
+        if packet.get("viaMqtt"):
+            return  # heard via MQTT, not a real RF neighbor
+        hs, hl = packet.get("hopStart"), packet.get("hopLimit")
+        if hs is None or hl is None or hs != hl:
+            return  # not a direct (0-hop) reception, or hop info missing
+        sender = packet.get("fromId") or ("!{:08x}".format(frm))
+        now = time.time()
+        if now - _direct_seen.get(sender, 0) < DIRECT_NEIGHBOR_THROTTLE_S:
+            return
+        _direct_seen[sender] = now
+        base_id = "!{:08x}".format(my_num)
+        with db() as c:
+            c.execute("INSERT INTO neighbors(ts, node_id, neighbor_id, snr) VALUES(?,?,?,?)",
+                      (now, base_id, sender, packet.get("rxSnr")))
+    except Exception as e:
+        log("direct-neighbor handler error: {}".format(e))
+
 def node_display(interface, node_id):
     try:
         n = (getattr(interface, "nodes", None) or {}).get(node_id, {})
@@ -1024,6 +1318,59 @@ def node_display(interface, node_id):
         return u.get("longName") or u.get("shortName") or node_id
     except Exception:
         return node_id
+
+def on_routing(packet=None, interface=None):
+    """5a: correlate ROUTING_APP ACK/NAK packets to an outstanding outbound send by
+    exact requestId, recency-fenced to 300s. Fully isolated co-subscriber to
+    meshtastic.receive — a failure here must never touch text handling. ACKs are
+    unauthenticated RF: state is display-only and drives NO automation."""
+    global acks_seen, acks_matched, ack_orphans, ack_db_errors, last_ack_ts, _ack_confirmed
+    try:
+        dec = (packet or {}).get("decoded", {}) or {}
+        if dec.get("portnum") != "ROUTING_APP":
+            return
+        req = dec.get("requestId")
+        if req is None:
+            return
+        # ACKs for OUR sends are addressed to us — skip third-party routing
+        # traffic before it costs a db() call on the radio-receive thread.
+        to_num = packet.get("to")
+        if to_num is not None and my_num is not None and to_num != my_num:
+            return
+        acks_seen += 1
+        last_ack_ts = time.time()
+        err = (dec.get("routing") or {}).get("errorReason")
+        from_num = packet.get("from")
+        with db() as c:
+            # Terminal states (ack/failed) never re-match; weaker states may be
+            # UPGRADED by a later, more definitive ROUTING packet (see ack_rank).
+            row = c.execute(
+                "SELECT id, node_id, is_dm, ack_state FROM msg_log WHERE mesh_id=? AND direction='out' "
+                "AND (ack_state IS NULL OR ack_state IN ('radio-accepted','relayed')) "
+                "AND ts > ? ORDER BY ts DESC LIMIT 1",
+                (req, time.time() - 300)).fetchone()
+            if row is None:
+                ack_orphans += 1
+                return
+            row_id, dest_id, is_dm, cur_state = row[0], row[1], bool(row[2]), row[3]
+            dest_num = None
+            ds = str(dest_id) if dest_id else ""
+            if ds.startswith("!") or ds.startswith("0x"):
+                try:
+                    dest_num = int(ds[1:] if ds.startswith("!") else ds, 16)
+                except ValueError:
+                    dest_num = None
+            state = ack_state_for(err, from_num, dest_num, my_num, is_dm)
+            if ack_rank(state) <= ack_rank(cur_state):
+                return  # not an upgrade — keep the stronger existing state
+            c.execute("UPDATE msg_log SET ack_state=? WHERE id=?", (state, row_id))
+            acks_matched += 1
+            if not _ack_confirmed:
+                _ack_confirmed = True
+                log("ACK TRACKING CONFIRMED — first ROUTING ack matched msg_log row {} -> {}".format(row_id, state))
+    except Exception as e:
+        ack_db_errors += 1   # increment BEFORE logging so a log-format throw still counts
+        log("routing handler error: {}".format(e))
 
 def on_lost(interface=None):
     log("mesh link lost; exiting for supervisor restart")
@@ -1054,12 +1401,15 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v8 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v12 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
     pub.subscribe(on_receive, "meshtastic.receive")
     pub.subscribe(on_telemetry, "meshtastic.receive.telemetry")   # v7: capture weather telemetry
+    pub.subscribe(on_neighbor, "meshtastic.receive")              # v9: capture neighbor links
+    pub.subscribe(on_direct_neighbor, "meshtastic.receive")       # v10: derive base's direct neighbors
+    pub.subscribe(on_routing, "meshtastic.receive")               # v11/5a: ACK/NAK delivery tracking
     pub.subscribe(on_lost, "meshtastic.connection.lost")
     if TCP_HOST:
         iface = meshtastic.tcp_interface.TCPInterface(TCP_HOST, portNumber=TCP_PORT)
@@ -1067,6 +1417,8 @@ def main():
         iface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL)
     info = iface.getMyNodeInfo() or {}
     my_num = info.get("num")
+    if not hasattr(iface, "sendText"):
+        log("CRITICAL: meshtastic interface has no sendText — sends + ACK tracking will fail")
     try:
         start_send_api()
     except Exception as e:
