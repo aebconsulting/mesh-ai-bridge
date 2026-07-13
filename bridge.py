@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v12 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v13 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v13 adds multi-collection retrieval: QDRANT_COLLECTIONS (comma-separated) searches every
+listed collection and merges hits by score — e.g. the general zim library plus a curated
+survival/medical corpus (SurvivalRAG) side by side. All collections must share the query
+embedder (nomic-embed-text 768/cosine). Per-collection failures degrade to the remaining
+collections; Kiwix fallback only when all are down.
 
 v12 adds replies & reactions: msg_log stores every message's mesh packet id, reply target
 (reply_to_id) and tapback flag (is_reaction); the send API accepts reply_id (quoted reply)
@@ -67,6 +73,10 @@ EMBED_URL = os.environ.get("EMBED_URL", "http://127.0.0.1:11434").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333").rstrip("/")
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "knowledge_base")
+# v13: search MULTIPLE collections and merge by score. Comma-separated names; unset =
+# just QDRANT_COLLECTION (back-compat). All collections must share the query embedder
+# (nomic-embed-text, 768/cosine) or the scores are not comparable.
+QDRANT_COLLECTIONS = [c.strip() for c in os.environ.get("QDRANT_COLLECTIONS", "").split(",") if c.strip()] or [QDRANT_COLLECTION]
 QDRANT_TOP_K = int(os.environ.get("QDRANT_TOP_K", "8"))
 QDRANT_MIN_SCORE = float(os.environ.get("QDRANT_MIN_SCORE", "0.65"))          # measured: relevant medical ~0.74-0.84, noise <=0.63
 QDRANT_TIMEOUT_S = int(os.environ.get("QDRANT_TIMEOUT_S", "10"))
@@ -632,15 +642,33 @@ def embed_query(q):
         return None
 
 def qdrant_search(vector, limit):
-    """qdrant vector search. Returns list of {score, payload} (score-desc) or None on failure
-    (logged). A returned hit is guaranteed to have a numeric (non-bool) `score` and a dict
-    `payload` whose `text` field, if present, is a string — so callers can safely subscript
-    hit["score"]/hit["payload"] and read payload["text"]. It does NOT guarantee every other
-    payload field is well-typed; the assembly loop in library_context() still coerces
-    defensively. Structurally-invalid hits are dropped and counted; a non-list `result` or a
-    transport failure returns None so callers fall back."""
+    """v13: search every collection in QDRANT_COLLECTIONS and merge score-desc (all
+    collections share the nomic-embed-text 768/cosine space, so scores are comparable).
+    One down collection must not blind the others: per-collection failures are logged
+    and skipped; None (-> Kiwix fallback) only when EVERY collection fails. Hit-shape
+    guarantees are _qdrant_search_one's, unchanged."""
+    merged, failures = [], 0
+    for coll in QDRANT_COLLECTIONS:
+        hits = _qdrant_search_one(vector, limit, coll)
+        if hits is None:
+            failures += 1
+            continue
+        merged.extend(hits)
+    if failures == len(QDRANT_COLLECTIONS):
+        return None
+    merged.sort(key=lambda h: h["score"], reverse=True)
+    return merged[:limit]
+
+def _qdrant_search_one(vector, limit, collection):
+    """qdrant vector search of ONE collection. Returns list of {score, payload} (score-desc)
+    or None on failure (logged). A returned hit is guaranteed to have a numeric (non-bool)
+    `score` and a dict `payload` whose `text` field, if present, is a string — so callers can
+    safely subscript hit["score"]/hit["payload"] and read payload["text"]. It does NOT
+    guarantee every other payload field is well-typed; the assembly loop in library_context()
+    still coerces defensively. Structurally-invalid hits are dropped and counted; a non-list
+    `result` or a transport failure returns None so callers fall back."""
     try:
-        r = requests.post("{}/collections/{}/points/search".format(QDRANT_URL, QDRANT_COLLECTION),
+        r = requests.post("{}/collections/{}/points/search".format(QDRANT_URL, collection),
                           json={"vector": vector, "limit": limit, "with_payload": True},
                           timeout=QDRANT_TIMEOUT_S)
         r.raise_for_status()
@@ -664,11 +692,11 @@ def qdrant_search(vector, limit):
             out.append({"score": float(s), "payload": pl})
         dropped = len(raw) - len(out)
         if dropped:                                  # B3: distinguish all-dropped from a true-empty result
-            log("qdrant_search: dropped {} malformed hit(s) of {}".format(dropped, len(raw)))
+            log("qdrant {}: dropped {} malformed hit(s) of {}".format(collection, dropped, len(raw)))
         out.sort(key=lambda h: h["score"], reverse=True)  # F3: defensive re-sort (medical stakes)
         return out
     except Exception as e:
-        log("qdrant unavailable ({}): {}".format(type(e).__name__, e))
+        log("qdrant {} unavailable ({}): {}".format(collection, type(e).__name__, e))
         return None
 
 def _kiwix_fallback(query):
@@ -1401,7 +1429,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v12 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v13 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()

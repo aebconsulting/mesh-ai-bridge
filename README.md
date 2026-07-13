@@ -71,7 +71,12 @@ library, *your* model, and a bridge that stays up.
 > **Note:** you supply the offline library. This repo is the bridge, not the corpus — it
 > reads a qdrant collection / Kiwix server you point it at. Building and embedding that
 > library is on you (a curated-corpus tool like SurvivalRAG, or your own ingestion, gets
-> you one).
+> you one). Since v13 the bridge searches **multiple collections** merged by score
+> (`QDRANT_COLLECTIONS=my_library,survivalrag`) — and
+> [`ingest_survivalrag_qdrant.py`](ingest_survivalrag_qdrant.py) loads SurvivalRAG's
+> pre-embedded corpus (same nomic-embed-text/768 space) into a qdrant collection as-is,
+> no re-embedding: a curated, citable survival/medical corpus next to your general
+> library in one command.
 
 ## How it works
 
