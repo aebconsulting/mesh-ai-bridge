@@ -85,3 +85,26 @@ def test_wired_into_both_paths():
     i_rc = SRC.index("rc = radio_check_reply(query, packet,")
     i_more = SRC.index('query.lower() not in ("more", "continue")')
     assert i_dedup < i_rc < i_more
+
+
+def _rca():
+    fn, _ = _extract("radio_check_allowed")
+    return fn
+
+
+def test_channel_cooldown_allows_then_blocks():
+    fn = _rca()
+    last = {}
+    assert fn("!a", 1000.0, last, 120) is True
+    assert fn("!a", 1060.0, last, 120) is False    # 60s later: blocked
+    assert fn("!a", 1121.0, last, 120) is True     # 121s later: allowed again
+    assert fn("!b", 1060.0, last, 120) is True     # other senders independent
+
+
+def test_channel_path_wired_with_guards():
+    # channel pong: env-gated, ALLOWED-gated, cooldown-gated, threaded via replyId
+    assert "RADIO_CHECK_CHANNEL and ch in ALLOWED" in SRC
+    assert "radio_check_allowed(sender, time.time(), _rc_last, RADIO_CHECK_COOLDOWN_S)" in SRC
+    i_dm = SRC.index("if is_dm:", SRC.index("Bare \"ping\"/\"test\" is a radio check"))
+    i_ch = SRC.index("elif (RADIO_CHECK_CHANNEL")
+    assert i_dm < i_ch

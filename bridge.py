@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """mesh-ai-bridge v14 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
 
-v14 adds a deterministic radio-check responder: "@ai ping"/"@ai test" (and bare
-"ping"/"test" DMs at the bridge) answer instantly with the mesh-conventional report
-(hop count, SNR when direct) from the packet's real reception data — never touching
-the LLM, the queue, or conversation history. LLM ping-roleplay hallucinations were
-observed when these reached the model.
+v14 adds a deterministic radio-check responder: "@ai ping"/"@ai test", bare
+"ping"/"test" DMs at the bridge, and bare channel radio checks (per-sender
+cooldown, RADIO_CHECK_CHANNEL=0 to disable) answer instantly with the
+mesh-conventional report (hop count, SNR when direct) from the packet's real
+reception data — never touching the LLM, the queue, or conversation history.
+LLM ping-roleplay hallucinations were observed when these reached the model.
 
 v13 adds multi-collection retrieval: QDRANT_COLLECTIONS (comma-separated) searches every
 listed collection and merges hits by score — e.g. the general zim library plus a curated
@@ -1206,6 +1207,23 @@ def _send_chunks(chunks, send):
         time.sleep(CHUNK_DELAY_S)
 
 RADIO_CHECKS = {"ping": "pong", "test": "test OK"}
+# Channel radio checks answer publicly (threaded to the ping) but per-sender
+# cooldown-limited: the bridge is one of several auto-responders on ch0, and an
+# unlimited public pong invites flood abuse. DMs at the bridge are exempt — a
+# deliberate check of THIS node should always answer (dedup still guards RF
+# retransmits). Set RADIO_CHECK_CHANNEL=0 to go DM-only if the mesh complains.
+RADIO_CHECK_CHANNEL = os.environ.get("RADIO_CHECK_CHANNEL", "1").lower() in ("1", "true", "yes")
+RADIO_CHECK_COOLDOWN_S = int(os.environ.get("RADIO_CHECK_COOLDOWN_S", "120"))
+_rc_last = {}   # sender -> last channel-pong ts (radio thread only)
+
+def radio_check_allowed(sender, now, last_map, cooldown_s):
+    """Per-sender cooldown for PUBLIC (channel) radio-check pongs. Mutates
+    last_map on allow. Pure enough to ast-extract and test."""
+    last = last_map.get(sender, 0)
+    if now - last < cooldown_s:
+        return False
+    last_map[sender] = now
+    return True
 
 def radio_check_reply(query, packet, node_count=None):
     """Deterministic radio-check responder. "ping"/"test" are mesh convention for
@@ -1280,14 +1298,19 @@ def on_receive(packet=None, interface=None):
         if is_reaction:
             return   # a tapback is never a query — logged flagged, nothing else
         if not is_ai:
-            # A bare "ping"/"test" DM'd AT the bridge is a radio check aimed at us —
-            # answer deterministically (no LLM, no history). Channel radio checks not
-            # addressed to us stay silent: answering every ch0 ping would burn airtime.
-            if is_dm:
-                rc = radio_check_reply(text, packet, len(getattr(interface, "nodes", None) or {}))
-                if rc is not None and not _is_duplicate(packet.get("id")):
+            # Bare "ping"/"test" is a radio check — answer deterministically (no LLM,
+            # no history). DMs at the bridge always answer; channel checks answer
+            # publicly, threaded to the ping, behind a per-sender cooldown (the mesh
+            # has other auto-responders and airtime is shared).
+            rc = radio_check_reply(text, packet, len(getattr(interface, "nodes", None) or {}))
+            if rc is not None and not _is_duplicate(packet.get("id")):
+                if is_dm:
                     _send_and_log(lambda: interface.sendText(rc, destinationId=sender, wantAck=True, replyId=mesh_id),
                                   sender, node_name, ch, True, True, rc, reply_to_id=mesh_id)
+                elif (RADIO_CHECK_CHANNEL and ch in ALLOWED
+                        and radio_check_allowed(sender, time.time(), _rc_last, RADIO_CHECK_COOLDOWN_S)):
+                    _send_and_log(lambda: interface.sendText(rc, channelIndex=ch, wantAck=True, replyId=mesh_id),
+                                  sender, node_name, ch, False, True, rc, reply_to_id=mesh_id)
             return
         query = text[len(PREFIX):].strip()
         if is_dm:
