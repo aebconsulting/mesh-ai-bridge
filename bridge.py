@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v16 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v17 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v17 adds operator-triggered mesh traceroute: POST /api/traceroute fires a non-blocking
+route-discovery probe (sendData(wantResponse=True), never the blocking sendTraceRoute)
+and inserts a pending traceroutes row keyed by request_id; on_traceroute, an isolated
+co-subscriber to meshtastic.receive, correlates the eventual TRACEROUTE_APP response (or
+a terminal ROUTING_APP failure) back to that row by exact requestId. States are reported
+honestly: pending (still in flight), ok (route filled in), failed:<REASON> (a routing
+error other than the literal string "NONE" — which is just a transit ack, not a verdict,
+and leaves the row pending), or timeout (swept on the next request past TRACEROUTE_TTL_S).
+A global 35s cooldown mirrors the firmware's own traceroute rate limit. Purely additive -
+no change to text handling, the query queue, or existing ACK tracking.
 
 v16: wires the TEI cross-encoder reranker (bge-reranker-v2-m3, :8091) into
 library retrieval behind RERANK_ENABLED. Floor-passing qdrant candidates are
@@ -55,7 +66,7 @@ v2 added SQLite memory (per-sender conversation history + long-term facts).
 that sender recent turns in context. Env-configured; drops on LLM failure;
 rate-limited; channel-scoped; LoRa-sized replies.
 """
-import os, re, sys, time, threading, collections, sqlite3, json, hmac
+import os, re, sys, time, threading, collections, sqlite3, json, hmac, math
 import queue as _queue
 import requests
 from pubsub import pub
@@ -208,6 +219,10 @@ def db():
     # v9: neighbor links (who each node hears directly) — for a mesh topology view.
     c.execute("CREATE TABLE IF NOT EXISTS neighbors(id INTEGER PRIMARY KEY, ts REAL, node_id TEXT, neighbor_id TEXT, snr REAL)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_neighbors_ts ON neighbors(ts)")
+    # v17: mesh traceroute requests + (eventually, via Task 4's on_traceroute) responses.
+    c.execute("CREATE TABLE IF NOT EXISTS traceroutes(id INTEGER PRIMARY KEY, ts REAL, dest TEXT, "
+              "dest_name TEXT, request_id INTEGER, hop_limit INTEGER, status TEXT, route TEXT, "
+              "snr_towards TEXT, route_back TEXT, snr_back TEXT, resp_ts REAL)")
     # v11/5a: per-message delivery tracking — outbound packet id + ACK/NAK state.
     _add_cols(c, "msg_log", [("mesh_id", "INTEGER"), ("ack_state", "TEXT")])
     c.execute("CREATE INDEX IF NOT EXISTS idx_msg_log_mesh_id ON msg_log(mesh_id)")
@@ -1096,6 +1111,8 @@ class SendHandler(BaseHTTPRequestHandler):
                           "last_ack_ts": last_ack_ts or None})
 
     def do_POST(self):
+        if self.path == "/api/traceroute":
+            return self._traceroute()
         if self.path != "/api/send":
             return self._reply(404, {"error": "not found"})
         if not SEND_TOKEN or not hmac.compare_digest(self.headers.get("X-Send-Token") or "", SEND_TOKEN):
@@ -1153,6 +1170,57 @@ class SendHandler(BaseHTTPRequestHandler):
         log("sendapi TX {} {}B id={}: {}".format("dm " + to if to else "ch{}".format(ch),
             len(text.encode()), getattr(pkt, "id", None), repr(text)))
         self._reply(200, {"ok": True})
+
+    def _traceroute(self):
+        """v17: fire a route-discovery probe. NON-BLOCKING by design — sendData(wantResponse)
+        returns immediately and on_traceroute (Task 4) fills the row in when (if) the mesh
+        answers. NEVER call `interface.sendTraceRoute()` here — the deployed meshtastic lib
+        blocks internally (waitForTraceRoute), prints to stdout, and raises MeshInterfaceError
+        on timeout."""
+        if not SEND_TOKEN or not hmac.compare_digest(self.headers.get("X-Send-Token") or "", SEND_TOKEN):
+            return self._reply(401, {"error": "unauthorized"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            if n < 0 or n > 1024:
+                return self._reply(400, {"error": "bad content-length"})
+            data = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(data, dict):
+                return self._reply(400, {"error": "body must be a JSON object"})
+        except Exception as e:
+            log("traceroute api bad request: {}".format(e))
+            return self._reply(400, {"error": "invalid JSON"})
+        to = data.get("to")
+        if not isinstance(to, str) or not re.fullmatch(r"![0-9a-fA-F]{8}", to):
+            return self._reply(400, {"error": "bad destination"})
+        hop_limit = data.get("hop_limit", 4)
+        if not isinstance(hop_limit, int) or isinstance(hop_limit, bool) or not 1 <= hop_limit <= 7:
+            return self._reply(400, {"error": "hop_limit must be 1..7"})
+        allowed, retry_after = traceroute_allowed_now()
+        if not allowed:
+            return self._reply(429, {"error": "traceroute cooling down (radio rate limit)",
+                                     "retry_after": retry_after})
+        if iface is None:
+            traceroute_release()   # never reached the air — don't burn the firmware's rate limit
+            return self._reply(503, {"error": "radio not connected"})
+        try:
+            pkt = iface.sendData(mesh_pb2.RouteDiscovery(), destinationId=to,
+                                 portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                 wantResponse=True, channelIndex=0, hopLimit=hop_limit)
+        except Exception as e:
+            log("traceroute radio send failed: {}".format(e))
+            traceroute_release()   # send never transmitted — give the slot back
+            return self._reply(502, {"error": "radio send failed"})
+        # protobuf scalar .id defaults to 0 (never None) — 0 == no id (see _send_and_log).
+        req_id = getattr(pkt, "id", 0) or None
+        with db() as c:
+            c.execute("UPDATE traceroutes SET status='timeout' WHERE status='pending' AND ts < ?",
+                      (time.time() - TRACEROUTE_TTL_S,))
+            cur = c.execute("INSERT INTO traceroutes(ts, dest, dest_name, request_id, hop_limit, status) "
+                            "VALUES(?,?,?,?,?,'pending')",
+                            (time.time(), to, node_display(iface, to), req_id, hop_limit))
+            row_id = cur.lastrowid
+        log("traceroute api TX to {} hop_limit={} request_id={}".format(to, hop_limit, req_id))
+        return self._reply(200, {"ok": True, "id": row_id, "request_id": req_id})
 
 def start_send_api():
     global send_api_alive
@@ -1298,6 +1366,33 @@ RADIO_CHECK_COOLDOWN_S = int(os.environ.get("RADIO_CHECK_COOLDOWN_S", "120"))
 ONLINE_WINDOW_S = int(os.environ.get("ONLINE_WINDOW_S", "7200"))
 _rc_last = {}   # sender -> last channel-pong ts (radio thread only)
 
+# v17: mesh traceroute. Firmware rate-limits route discovery (~30s); one GLOBAL
+# 35s gate — a second concurrent trace would be refused by the radio anyway.
+TRACEROUTE_COOLDOWN_S = int(os.environ.get("TRACEROUTE_COOLDOWN_S", "35"))
+TRACEROUTE_TTL_S = int(os.environ.get("TRACEROUTE_TTL_S", "120"))   # pending older than this = timeout
+_tr_last = {}
+
+def traceroute_allowed_now():
+    """Thread-safe global gate for route discovery (the send API is a
+    ThreadingHTTPServer: one thread per POST, so an unlocked check-then-act
+    would let two concurrent probes both pass). Returns (allowed, retry_after):
+    retry_after is the ACTUAL seconds remaining, not the constant."""
+    now = time.time()
+    with lock:
+        last = _tr_last.get("global", 0)
+        remaining = TRACEROUTE_COOLDOWN_S - (now - last)
+        if remaining > 0:
+            return False, int(math.ceil(remaining))
+        _tr_last["global"] = now
+        return True, 0
+
+def traceroute_release():
+    """Give the cooldown slot back when a probe never reached the air (radio
+    down, send raised). The cooldown mirrors the FIRMWARE's rate limit, so a
+    transmission that never happened must not consume it."""
+    with lock:
+        _tr_last.pop("global", None)
+
 
 def count_online(nodes, now, window_s=None):
     """Nodes heard within the online window, from a meshtastic interface.nodes
@@ -1371,6 +1466,97 @@ def _inbound_meta(packet, dec):
     reply_to = dec.get("replyId") or None
     reacted = 1 if dec.get("emoji") else None
     return mesh_id, reply_to, reacted
+
+def parse_traceroute(packet):
+    """Normalize a TRACEROUTE_APP response into route lists. Returns
+    (request_id, result) or (None, None). SNR wire format is dB*4, -128 =
+    unknown -> None. Protobuf-dict omits empty fields: absent route keys = [].
+    route/routeBack are INTERMEDIATE hops only (endpoints implied). Node
+    numbers are uint32 (0..0xFFFFFFFF) -- an out-of-range value cannot be
+    formatted as a real 8-hex-digit id.
+    Parses unauthenticated RF input: any structurally-invalid field (wrong
+    type at any nesting level, a list containing a bad-typed element, or a
+    node number outside uint32 range) fails the WHOLE parse closed --
+    (None, None) -- rather than crash or emit a result with a bogus id.
+    route/snrTowards and routeBack/snrBack are additionally cross-checked:
+    the wire format guarantees len(snrTowards) == len(route)+1 (ditto for
+    the back leg). A length mismatch degrades ONLY the SNR list to unknown
+    (None) placeholders of the correct length -- the route itself is real,
+    received data and is never discarded for an SNR-side mismatch."""
+    if not isinstance(packet, dict):
+        return None, None
+    dec = packet.get("decoded")
+    if not isinstance(dec, dict):
+        return None, None
+    if dec.get("portnum") != "TRACEROUTE_APP":
+        return None, None
+    req = dec.get("requestId")
+    if not isinstance(req, int) or isinstance(req, bool):
+        return None, None
+    tr = dec.get("traceroute")
+    if tr is None:
+        tr = {}
+    elif not isinstance(tr, dict):
+        return None, None
+    def _valid_node_num(x):
+        # Meshtastic node numbers are uint32. Non-int/bool, negative, or
+        # >0xFFFFFFFF values are not real node ids.
+        return isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 0xFFFFFFFF
+    def _valid_list(key, node_ids=False):
+        # Absent key -> [] (protobuf-dict omits empty fields). Present but not
+        # a list, or containing any non-int/bool element (or, for node-id
+        # lists, any out-of-uint32-range element) -> None (invalid) so the
+        # caller can fail the whole parse instead of silently dropping the
+        # bad element and shifting every later hop's SNR-to-route alignment.
+        v = tr.get(key)
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            return None
+        for x in v:
+            if node_ids:
+                if not _valid_node_num(x):
+                    return None
+            elif not isinstance(x, int) or isinstance(x, bool):
+                return None
+        return v
+    route, snr_towards, route_back, snr_back = (
+        _valid_list("route", node_ids=True), _valid_list("snrTowards"),
+        _valid_list("routeBack", node_ids=True), _valid_list("snrBack"))
+    if route is None or snr_towards is None or route_back is None or snr_back is None:
+        return None, None
+    def _degrade_if_misaligned(route_list, snr_list):
+        # Wire format guarantees len(snrTowards) == len(route)+1 (one reading
+        # per intermediate hop, plus a final entry for the destination's own
+        # reading) -- same rule for snrBack vs routeBack. A length mismatch
+        # means the SNR list cannot be trusted to line up with the route: hop
+        # N could end up displayed with hop N+1's signal reading. The ROUTE is
+        # real, received data and is never discarded for this -- only the SNR
+        # list degrades, to -128 (unknown) sentinels of the CORRECT length, so
+        # every hop is honestly reported as "signal unknown" instead of wrong.
+        expected_len = len(route_list) + 1
+        if len(snr_list) != expected_len:
+            return [-128] * expected_len
+        return snr_list
+    snr_towards = _degrade_if_misaligned(route, snr_towards)
+    snr_back = _degrade_if_misaligned(route_back, snr_back)
+    def _snrs(vals):
+        return [None if v == -128 else v / 4.0 for v in vals]
+    def _ids(vals):
+        return ["!{:08x}".format(n) for n in vals]
+    hop_start = packet.get("hopStart")
+    from_id = packet.get("fromId")
+    if isinstance(from_id, str) and from_id:
+        responder = from_id
+    else:
+        from_num = packet.get("from", 0)
+        responder = "!{:08x}".format(from_num) if _valid_node_num(from_num) else None
+    return req, {
+        "route": _ids(route), "snr_towards": _snrs(snr_towards),
+        "route_back": _ids(route_back), "snr_back": _snrs(snr_back),
+        "responder": responder,
+        "hop_start": hop_start if isinstance(hop_start, int) and not isinstance(hop_start, bool) else None,
+    }
 
 def make_quoted_send(send_raw, quote_id):
     """Wrap a two-arg send(chunk, rid) into the one-arg send(chunk) the worker
@@ -1586,6 +1772,54 @@ def on_routing(packet=None, interface=None):
         ack_db_errors += 1   # increment BEFORE logging so a log-format throw still counts
         log("routing handler error: {}".format(e))
 
+def on_traceroute(packet=None, interface=None):
+    """v17: correlate TRACEROUTE_APP responses (and ROUTING_APP failures) to a
+    pending traceroutes row by exact requestId. Fully isolated co-subscriber to
+    meshtastic.receive — a failure here must never touch text handling. RF is
+    unauthenticated: results are display-only and drive NO automation."""
+    try:
+        dec = (packet or {}).get("decoded", {}) or {}
+        pn = dec.get("portnum")
+        if pn not in ("TRACEROUTE_APP", "ROUTING_APP"):
+            return
+        to_num = packet.get("to")
+        if to_num is not None and my_num is not None and to_num != my_num:
+            return
+        if pn == "TRACEROUTE_APP":
+            req, result = parse_traceroute(packet)
+            if req is None:
+                return
+            with db() as c:
+                row = c.execute("SELECT id FROM traceroutes WHERE request_id=? AND status='pending' "
+                                "AND ts > ? ORDER BY ts DESC LIMIT 1",
+                                (req, time.time() - 600)).fetchone()
+                if row is None:
+                    return
+                c.execute("UPDATE traceroutes SET status='ok', route=?, snr_towards=?, route_back=?, "
+                          "snr_back=?, resp_ts=? WHERE id=?",
+                          (json.dumps(result["route"]), json.dumps(result["snr_towards"]),
+                           json.dumps(result["route_back"]), json.dumps(result["snr_back"]),
+                           time.time(), row[0]))
+            log("traceroute answered: request_id={} {} hop(s) towards".format(req, len(result["route"])))
+        else:
+            req = dec.get("requestId")
+            if not isinstance(req, int) or isinstance(req, bool):
+                return
+            err = (dec.get("routing") or {}).get("errorReason")
+            if not err or err == "NONE":
+                return   # transit ack, not a verdict — the route may still arrive
+            with db() as c:
+                row = c.execute("SELECT id FROM traceroutes WHERE request_id=? AND status='pending' "
+                                "AND ts > ? ORDER BY ts DESC LIMIT 1",
+                                (req, time.time() - 600)).fetchone()
+                if row is None:
+                    return
+                c.execute("UPDATE traceroutes SET status=?, resp_ts=? WHERE id=?",
+                          ("failed:{}".format(err), time.time(), row[0]))
+            log("traceroute failed: request_id={} {}".format(req, err))
+    except Exception as e:
+        log("traceroute handler error: {}".format(e))
+
 def on_lost(interface=None):
     log("mesh link lost; exiting for supervisor restart")
     os._exit(1)
@@ -1615,7 +1849,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v16 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v17 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
@@ -1624,6 +1858,7 @@ def main():
     pub.subscribe(on_neighbor, "meshtastic.receive")              # v9: capture neighbor links
     pub.subscribe(on_direct_neighbor, "meshtastic.receive")       # v10: derive base's direct neighbors
     pub.subscribe(on_routing, "meshtastic.receive")               # v11/5a: ACK/NAK delivery tracking
+    pub.subscribe(on_traceroute, "meshtastic.receive")            # v17: traceroute responses
     pub.subscribe(on_lost, "meshtastic.connection.lost")
     if TCP_HOST:
         iface = meshtastic.tcp_interface.TCPInterface(TCP_HOST, portNumber=TCP_PORT)
