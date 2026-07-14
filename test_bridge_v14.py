@@ -78,13 +78,64 @@ def test_bool_and_malformed_fields_are_safe():
 def test_wired_into_both_paths():
     # @ai path: after dedup, before the cooldown block; bare-DM path inside `if not is_ai`
     assert SRC.count("radio_check_reply(") >= 3          # def + 2 call sites
-    assert 'rc = radio_check_reply(query, packet, len(getattr(interface, "nodes", None) or {}))' in SRC
-    assert 'rc = radio_check_reply(text, packet, len(getattr(interface, "nodes", None) or {}))' in SRC
+    # v15: both call sites pass total-known AND the live online count
+    assert "rc = radio_check_reply(query, packet, len(_nodes), count_online(_nodes, time.time()))" in SRC
+    assert "rc = radio_check_reply(text, packet, len(_nodes), count_online(_nodes, time.time()))" in SRC
     # the @ai call must come AFTER the dedup guard and BEFORE the cooldown exemption comment
     i_dedup = SRC.index("dropping duplicate retransmit")
     i_rc = SRC.index("rc = radio_check_reply(query, packet,")
     i_more = SRC.index('query.lower() not in ("more", "continue")')
     assert i_dedup < i_rc < i_more
+
+
+# ---------- v15: pong reports live mesh activity, not nodedb size ----------
+
+def _co():
+    fn, _ = _extract("count_online", {"ONLINE_WINDOW_S": 7200})
+    return fn
+
+
+def test_online_count_preferred_over_known():
+    fn = _rc()
+    assert fn("ping", {"hopStart": 3, "hopLimit": 3, "rxSnr": 8.25}, 236, 41) == \
+        "pong — heard you direct, SNR 8.25 dB · bridge + \"@ai\" up, 41 nodes online"
+    assert fn("test", {}, 10, 3) == "test OK · bridge + \"@ai\" up, 3 nodes online"
+
+
+def test_online_missing_or_zero_falls_back_to_known():
+    fn = _rc()
+    # no online data (None) or a false-looking 0 -> old total-known tail
+    assert fn("ping", {}, 236, None) == "pong · bridge + \"@ai\" online, 236 nodes known"
+    assert fn("ping", {}, 236, 0) == "pong · bridge + \"@ai\" online, 236 nodes known"
+    assert fn("ping", {}, 236, True) == "pong · bridge + \"@ai\" online, 236 nodes known"
+    assert fn("ping", {}, None, None) == "pong · bridge + \"@ai\" online"
+
+
+def test_online_reply_fits_one_lora_chunk():
+    fn = _rc()
+    worst = fn("test", {"hopStart": 7, "hopLimit": 0, "rxSnr": -20.25}, 99999, 99999)
+    assert len(worst.encode("utf-8")) < 190
+
+
+def test_count_online_windows_and_malformed():
+    fn = _co()
+    now = 100000.0
+    nodes = {
+        "!a": {"lastHeard": now - 60},        # fresh
+        "!b": {"lastHeard": now - 7100},      # inside 2h
+        "!c": {"lastHeard": now - 7300},      # stale
+        "!d": {},                             # no field
+        "!e": None,                           # malformed entry
+        "!f": {"lastHeard": True},            # bool is not a timestamp
+    }
+    assert fn(nodes, now) == 2
+
+
+def test_count_online_no_usable_data_returns_none():
+    fn = _co()
+    assert fn({}, 1000.0) is None
+    assert fn(None, 1000.0) is None
+    assert fn({"!a": {}, "!b": None, "!c": {"lastHeard": False}}, 1000.0) is None
 
 
 def _rca():

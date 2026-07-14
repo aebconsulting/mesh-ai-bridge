@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v14 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v15 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v15: the radio-check pong tail reports live mesh activity — nodes heard within
+ONLINE_WINDOW_S (default 2h, the Meridian dashboard's "online" convention) —
+instead of total nodedb size, which counts weeks-stale entries. Falls back to
+"N nodes known" when the nodedb carries no lastHeard data.
 
 v14 adds a deterministic radio-check responder: "@ai ping"/"@ai test", bare
 "ping"/"test" DMs at the bridge, and bare channel radio checks (per-sender
@@ -1214,7 +1219,27 @@ RADIO_CHECKS = {"ping": "pong", "test": "test OK"}
 # retransmits). Set RADIO_CHECK_CHANNEL=0 to go DM-only if the mesh complains.
 RADIO_CHECK_CHANNEL = os.environ.get("RADIO_CHECK_CHANNEL", "1").lower() in ("1", "true", "yes")
 RADIO_CHECK_COOLDOWN_S = int(os.environ.get("RADIO_CHECK_COOLDOWN_S", "120"))
+# v15: pong reports nodes heard within this window (2h = the dashboard's "online"
+# convention, so the pong and Meridian agree) instead of total nodedb size.
+ONLINE_WINDOW_S = int(os.environ.get("ONLINE_WINDOW_S", "7200"))
 _rc_last = {}   # sender -> last channel-pong ts (radio thread only)
+
+
+def count_online(nodes, now, window_s=None):
+    """Nodes heard within the online window, from a meshtastic interface.nodes
+    dict. Returns None when NO entry carries a usable lastHeard (empty nodedb,
+    firmware without the field) so the caller falls back to total-known instead
+    of reporting a false 0 — the pinger we just heard is plainly online."""
+    if window_s is None:
+        window_s = ONLINE_WINDOW_S
+    n, seen = 0, False
+    for v in (nodes or {}).values():
+        lh = (v or {}).get("lastHeard") if isinstance(v, dict) else None
+        if isinstance(lh, (int, float)) and not isinstance(lh, bool):
+            seen = True
+            if now - lh <= window_s:
+                n += 1
+    return n if seen else None
 
 def radio_check_allowed(sender, now, last_map, cooldown_s):
     """Per-sender cooldown for PUBLIC (channel) radio-check pongs. Mutates
@@ -1225,7 +1250,7 @@ def radio_check_allowed(sender, now, last_map, cooldown_s):
     last_map[sender] = now
     return True
 
-def radio_check_reply(query, packet, node_count=None):
+def radio_check_reply(query, packet, node_count=None, online_count=None):
     """Deterministic radio-check responder. "ping"/"test" are mesh convention for
     "can anyone hear me?" — they must NEVER reach the LLM (which, given an
     encyclopedia article about ping and its own prior replies, will roleplay
@@ -1252,9 +1277,15 @@ def radio_check_reply(query, packet, node_count=None):
         detail = "heard you via {} hop{}".format(hops, "" if hops == 1 else "s")
     else:
         detail = None
-    tail = 'bridge + "@ai" online'   # every pong teaches the mesh how to invoke the AI
-    if isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
-        tail += ", {} nodes known".format(node_count)
+    # Every pong teaches the mesh how to invoke the AI. v15: live activity (nodes
+    # heard in the online window) is what a pinger actually wants — total nodedb
+    # size counts weeks-stale entries. Fall back to total-known without lastHeard data.
+    if isinstance(online_count, int) and not isinstance(online_count, bool) and online_count > 0:
+        tail = 'bridge + "@ai" up, {} nodes online'.format(online_count)
+    elif isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
+        tail = 'bridge + "@ai" online, {} nodes known'.format(node_count)
+    else:
+        tail = 'bridge + "@ai" online'
     head = "{} — {}".format(word, detail) if detail else word
     return "{} · {}".format(head, tail)
 
@@ -1302,7 +1333,8 @@ def on_receive(packet=None, interface=None):
             # no history). DMs at the bridge always answer; channel checks answer
             # publicly, threaded to the ping, behind a per-sender cooldown (the mesh
             # has other auto-responders and airtime is shared).
-            rc = radio_check_reply(text, packet, len(getattr(interface, "nodes", None) or {}))
+            _nodes = getattr(interface, "nodes", None) or {}
+            rc = radio_check_reply(text, packet, len(_nodes), count_online(_nodes, time.time()))
             if rc is not None and not _is_duplicate(packet.get("id")):
                 if is_dm:
                     _send_and_log(lambda: interface.sendText(rc, destinationId=sender, wantAck=True, replyId=mesh_id),
@@ -1340,7 +1372,8 @@ def on_receive(packet=None, interface=None):
         # Radio checks are answered deterministically and immediately — never queued,
         # never sent to the LLM, exempt from the cooldown (an unanswered radio check
         # is indistinguishable from a dead node, which defeats its purpose).
-        rc = radio_check_reply(query, packet, len(getattr(interface, "nodes", None) or {}))
+        _nodes = getattr(interface, "nodes", None) or {}
+        rc = radio_check_reply(query, packet, len(_nodes), count_online(_nodes, time.time()))
         if rc is not None:
             send(rc)   # the quoted-send wrapper threads it to the ping via replyId
             return
@@ -1508,7 +1541,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v14 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v15 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
