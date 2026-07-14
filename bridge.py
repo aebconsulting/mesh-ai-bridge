@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v15 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v16 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v16: wires the TEI cross-encoder reranker (bge-reranker-v2-m3, :8091) into
+library retrieval behind RERANK_ENABLED. Floor-passing qdrant candidates are
+re-scored against the query, reordered, and noise chunks (rerank score below
+RERANK_MIN_SCORE) are dropped — cosine similarity retrieves look-alike noise
+(ROS "node" articles for mesh-status questions) that the cross-encoder rates
+~2e-5 vs 0.7+ for genuinely relevant text. Any reranker failure degrades to
+qdrant order; reranking never costs an answer.
 
 v15: the radio-check pong tail reports live mesh activity — nodes heard within
 ONLINE_WINDOW_S (default 2h, the Meridian dashboard's "online" convention) —
@@ -94,7 +102,16 @@ QDRANT_MIN_SCORE = float(os.environ.get("QDRANT_MIN_SCORE", "0.65"))          # 
 QDRANT_TIMEOUT_S = int(os.environ.get("QDRANT_TIMEOUT_S", "10"))
 EMBED_TIMEOUT_S = int(os.environ.get("EMBED_TIMEOUT_S", "15"))
 MIN_CHUNK_CHARS = int(os.environ.get("MIN_CHUNK_CHARS", "120"))               # F1: skip tiny fragments; a 2-word snippet is not usable medical context
-RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "").lower() in ("1", "true", "yes")  # DEFAULT OFF: future cross-encoder rerank hook, not wired in v1
+RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "").lower() in ("1", "true", "yes")  # DEFAULT OFF: cross-encoder rerank (wired in v16)
+# Reach the TEI reranker by CONTAINER NAME on the shared NOMAD network, not via a host
+# gateway: :8091 is UFW-scoped to the LAN, so both 172.17.0.1 and 172.18.0.1 silently DROP
+# (verified — a timeout, not a refusal), which would stall every library query for the full
+# timeout and then degrade, reranking nothing. Container DNS answers in ~1.2s.
+RERANK_URL = os.environ.get("RERANK_URL", "http://nomad_custom_reranker:80")
+# This sits on the ~1.7s mesh reply path, so the timeout is a latency budget, not a
+# generous ceiling: a reranker slower than this is worse than no reranker.
+RERANK_TIMEOUT_S = float(os.environ.get("RERANK_TIMEOUT_S", "5"))
+RERANK_MIN_SCORE = float(os.environ.get("RERANK_MIN_SCORE", "0.001"))          # measured: relevant 0.7+, look-alike noise ~2e-5
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "6"))
 FACTS_MAX = int(os.environ.get("FACTS_MAX", "20"))
 SYSPROMPT = os.environ.get("SYSTEM_PROMPT",
@@ -622,7 +639,6 @@ def build_messages(sender, query, is_dm=False):
 
 # ---------- offline library retrieval (v6/2b-i: qdrant semantic search, replaces cross-encoder) ----------
 _book_ids = {}
-_rerank_warned = False   # F6: emit the "RERANK_ENABLED set but not wired" warning at most once
 
 def load_books():
     global _book_ids
@@ -748,6 +764,55 @@ def _kiwix_fallback(query):
     log("kiwix fallback: nothing")
     return ""
 
+def rerank_hits(query, hits):
+    """v16: cross-encoder rerank via the TEI bge-reranker (:8091). Re-scores every
+    candidate chunk against the actual query, reorders by relevance, and DROPS
+    chunks below RERANK_MIN_SCORE — cosine retrieval returns look-alike noise
+    (ROS articles for "which nodes are online?") that the cross-encoder scores at
+    ~2e-5 vs 0.7+ for genuinely relevant text. Returns [] when EVERY candidate is
+    noise (caller injects no context). Degrades to the input order on ANY failure
+    (service down, timeout, malformed reply) — reranking must never cost a
+    medical answer. Response is validated strictly: same length as the request,
+    unique in-range int indices, numeric scores; anything else = malformed."""
+    if not hits:
+        return hits
+    try:
+        t0 = time.time()
+        texts = [str((h.get("payload") or {}).get("text") or "") for h in hits]
+        r = requests.post(RERANK_URL.rstrip("/") + "/rerank",
+                          json={"query": query, "texts": texts, "truncate": True},
+                          timeout=RERANK_TIMEOUT_S)
+        r.raise_for_status()
+        ranked = r.json()
+        # Accept a SHORTER ranking (a TEI top-N config returns fewer entries than texts) —
+        # rerank what came back rather than no-op'ing the feature. Empty or longer-than-input
+        # is incoherent, though: treat it as malformed and degrade.
+        if not isinstance(ranked, list) or not 0 < len(ranked) <= len(hits):
+            raise ValueError("expected 1..{} entries, got {!r}".format(
+                len(hits), len(ranked) if isinstance(ranked, list) else type(ranked).__name__))
+        pairs, seen = [], set()
+        for e in ranked:
+            i, s = e["index"], e["score"]
+            if not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < len(hits) or i in seen:
+                raise ValueError("bad index {!r}".format(i))
+            if not isinstance(s, (int, float)) or isinstance(s, bool):
+                raise ValueError("bad score {!r}".format(s))
+            seen.add(i)
+            pairs.append((s, i))
+        pairs.sort(key=lambda p: -p[0])
+        out = []
+        for s, i in pairs:
+            if s < RERANK_MIN_SCORE:
+                break                  # sorted desc; everything past here is noise
+            hits[i]["rerank"] = s
+            out.append(hits[i])
+        log("rerank: {} -> {} hits in {:.2f}s (top r={:.4f})".format(
+            len(hits), len(out), time.time() - t0, out[0]["rerank"] if out else 0.0))
+        return out
+    except Exception as e:
+        log("rerank unavailable ({}): {} — using qdrant order".format(type(e).__name__, e))
+        return hits
+
 def library_context(query):
     """Semantic retrieval: embed the query, vector-search the offline library, inject the best
     chunks. Falls back to Kiwix first-wins if embed/qdrant are down. Every no-context outcome is
@@ -756,7 +821,6 @@ def library_context(query):
     str() and is wrapped per-hit in try/except, so a malformed hit is skipped-and-logged and can
     NEVER raise out of here (which would be swallowed by handle_query's LLM-unreachable catch and
     silently drop a medical query)."""
-    global _rerank_warned
     t0 = time.time()
     vec = embed_query(query)
     if vec is None:
@@ -766,9 +830,6 @@ def library_context(query):
     if hits is None:
         log("library_context: qdrant down -> kiwix fallback")
         return _kiwix_fallback(query)
-    if RERANK_ENABLED and not _rerank_warned:
-        log("RERANK_ENABLED set but rerank layer not wired in v1")  # F6: don't silently ignore the flag
-        _rerank_warned = True
     if not hits:
         log("library_context: qdrant returned zero hits, no context injected ({:.2f}s)".format(time.time() - t0))
         return ""
@@ -776,6 +837,16 @@ def library_context(query):
         log("library_context: top score {:.3f} < floor {}, no context injected ({:.2f}s)".format(
             hits[0]["score"], QDRANT_MIN_SCORE, time.time() - t0))
         return ""
+    if RERANK_ENABLED:
+        # v16: cross-encoder rerank of the floor-passing candidates. [] = every
+        # candidate was look-alike noise -> inject nothing (the LLM answers from
+        # the system prompt alone, which is exactly right for status questions).
+        kept = [h for h in hits if h["score"] >= QDRANT_MIN_SCORE]
+        hits = rerank_hits(query, kept)
+        if not hits:
+            log("library_context: rerank dropped all {} candidate(s) as noise, no context injected ({:.2f}s)".format(
+                len(kept), time.time() - t0))
+            return ""
     parts, total, winners, too_short = [], 0, [], 0
     for h in hits:
         if h["score"] < QDRANT_MIN_SCORE:
@@ -799,7 +870,10 @@ def library_context(query):
             break                      # budget full
         parts.append(entry)
         total += len(entry)
-        winners.append("{}({:.2f})".format(title[:40], h["score"]))
+        # rerank scores span 0.7 down to the 0.001 floor — 4dp, or a kept marginal chunk
+        # logs as "/r0.00" and reads like noise that should have been dropped.
+        winners.append("{}({:.2f}{})".format(
+            title[:40], h["score"], "/r{:.4f}".format(h["rerank"]) if "rerank" in h else ""))
     if too_short:
         log("library_context: skipped {} too-short chunk(s) (< {}c)".format(too_short, MIN_CHUNK_CHARS))
     if not parts:
@@ -1541,7 +1615,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v15 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v16 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
