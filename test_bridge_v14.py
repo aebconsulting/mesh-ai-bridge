@@ -24,34 +24,34 @@ def _rc():
 
 def test_ping_direct_with_snr():
     fn = _rc()
-    assert fn("ping", {"hopStart": 3, "hopLimit": 3, "rxSnr": 8.25}, 236) ==         "pong — heard you direct, SNR 8.25 dB · bridge + AI online, 236 nodes known"
+    assert fn("ping", {"hopStart": 3, "hopLimit": 3, "rxSnr": 8.25}, 236) ==         "pong — heard you direct, SNR 8.25 dB · bridge + \"@ai\" online, 236 nodes known"
 
 
 def test_ping_direct_without_snr():
     fn = _rc()
-    assert fn("ping", {"hopStart": 3, "hopLimit": 3}) == "pong — heard you direct · bridge + AI online"
+    assert fn("ping", {"hopStart": 3, "hopLimit": 3}) == "pong — heard you direct · bridge + \"@ai\" online"
 
 
 def test_ping_multihop_reports_hop_count():
     fn = _rc()
-    assert fn("ping", {"hopStart": 3, "hopLimit": 1}, 10) ==         "pong — heard you via 2 hops · bridge + AI online, 10 nodes known"
-    assert fn("ping", {"hopStart": 3, "hopLimit": 2}) == "pong — heard you via 1 hop · bridge + AI online"
+    assert fn("ping", {"hopStart": 3, "hopLimit": 1}, 10) ==         "pong — heard you via 2 hops · bridge + \"@ai\" online, 10 nodes known"
+    assert fn("ping", {"hopStart": 3, "hopLimit": 2}) == "pong — heard you via 1 hop · bridge + \"@ai\" online"
 
 
 def test_ping_no_hop_data_bare_word():
     fn = _rc()
-    assert fn("ping", {}) == "pong · bridge + AI online"
+    assert fn("ping", {}) == "pong · bridge + \"@ai\" online"
 
 
 def test_test_word():
     fn = _rc()
-    assert fn("test", {"hopStart": 5, "hopLimit": 4}) == "test OK — heard you via 1 hop · bridge + AI online"
+    assert fn("test", {"hopStart": 5, "hopLimit": 4}) == "test OK — heard you via 1 hop · bridge + \"@ai\" online"
 
 
 def test_case_and_punctuation_normalized():
     fn = _rc()
-    assert fn("  PING! ", {}) == "pong · bridge + AI online"
-    assert fn("Test?", {}) == "test OK · bridge + AI online"
+    assert fn("  PING! ", {}) == "pong · bridge + \"@ai\" online"
+    assert fn("Test?", {}) == "test OK · bridge + \"@ai\" online"
 
 
 def test_non_checks_return_none():
@@ -69,10 +69,10 @@ def test_reply_fits_one_lora_chunk():
 def test_bool_and_malformed_fields_are_safe():
     fn = _rc()
     # bools are int subclasses; malformed hopStart<hopLimit means unknown, not negative
-    assert fn("ping", {"hopStart": True, "hopLimit": True}) == "pong · bridge + AI online"
-    assert fn("ping", {"hopStart": 1, "hopLimit": 3}) == "pong · bridge + AI online"
-    assert fn("ping", {"hopStart": 3, "hopLimit": 3, "rxSnr": True}) == "pong — heard you direct · bridge + AI online"
-    assert fn("ping", {}, True) == "pong · bridge + AI online"
+    assert fn("ping", {"hopStart": True, "hopLimit": True}) == "pong · bridge + \"@ai\" online"
+    assert fn("ping", {"hopStart": 1, "hopLimit": 3}) == "pong · bridge + \"@ai\" online"
+    assert fn("ping", {"hopStart": 3, "hopLimit": 3, "rxSnr": True}) == "pong — heard you direct · bridge + \"@ai\" online"
+    assert fn("ping", {}, True) == "pong · bridge + \"@ai\" online"
 
 
 def test_wired_into_both_paths():

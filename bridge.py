@@ -1252,7 +1252,7 @@ def radio_check_reply(query, packet, node_count=None):
         detail = "heard you via {} hop{}".format(hops, "" if hops == 1 else "s")
     else:
         detail = None
-    tail = "bridge + AI online"
+    tail = 'bridge + "@ai" online'   # every pong teaches the mesh how to invoke the AI
     if isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
         tail += ", {} nodes known".format(node_count)
     head = "{} — {}".format(word, detail) if detail else word
