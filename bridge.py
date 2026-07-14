@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v13 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v14 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v14 adds a deterministic radio-check responder: "@ai ping"/"@ai test" (and bare
+"ping"/"test" DMs at the bridge) answer instantly with the mesh-conventional report
+(hop count, SNR when direct) from the packet's real reception data — never touching
+the LLM, the queue, or conversation history. LLM ping-roleplay hallucinations were
+observed when these reached the model.
 
 v13 adds multi-collection retrieval: QDRANT_COLLECTIONS (comma-separated) searches every
 listed collection and merges hits by score — e.g. the general zim library plus a curated
@@ -1199,6 +1205,41 @@ def _send_chunks(chunks, send):
         log("reply {} ({}B): {}".format(i + 1, len(c.encode()), repr(c)))
         time.sleep(CHUNK_DELAY_S)
 
+RADIO_CHECKS = {"ping": "pong", "test": "test OK"}
+
+def radio_check_reply(query, packet, node_count=None):
+    """Deterministic radio-check responder. "ping"/"test" are mesh convention for
+    "can anyone hear me?" — they must NEVER reach the LLM (which, given an
+    encyclopedia article about ping and its own prior replies, will roleplay
+    running one — observed 2026-07-14: invented nodes N1-N5 with fake statuses).
+    Returns None unless the query is a bare ping/test; otherwise a signal report
+    from the packet's REAL reception data (hop count, SNR when direct) plus a
+    bridge-status tail — a radio check at the AI node is really asking "is the
+    whole stack alive?", so answer that too."""
+    q = (query or "").strip().lower().strip("!?.,~ ")
+    word = RADIO_CHECKS.get(q)
+    if not word:
+        return None
+    hs, hl = packet.get("hopStart"), packet.get("hopLimit")
+    snr = packet.get("rxSnr")
+    hops = None
+    if (isinstance(hs, int) and not isinstance(hs, bool)
+            and isinstance(hl, int) and not isinstance(hl, bool) and hs >= hl):
+        hops = hs - hl
+    if hops == 0:
+        detail = "heard you direct"
+        if isinstance(snr, (int, float)) and not isinstance(snr, bool):
+            detail += ", SNR {} dB".format(round(snr, 2))
+    elif hops is not None:
+        detail = "heard you via {} hop{}".format(hops, "" if hops == 1 else "s")
+    else:
+        detail = None
+    tail = "bridge + AI online"
+    if isinstance(node_count, int) and not isinstance(node_count, bool) and node_count > 0:
+        tail += ", {} nodes known".format(node_count)
+    head = "{} — {}".format(word, detail) if detail else word
+    return "{} · {}".format(head, tail)
+
 def _inbound_meta(packet, dec):
     """Pull (mesh_id, reply_to_id, is_reaction) from an inbound packet dict.
     Protobuf-dict defaults are OMITTED: replyId/emoji are absent on normal
@@ -1239,6 +1280,14 @@ def on_receive(packet=None, interface=None):
         if is_reaction:
             return   # a tapback is never a query — logged flagged, nothing else
         if not is_ai:
+            # A bare "ping"/"test" DM'd AT the bridge is a radio check aimed at us —
+            # answer deterministically (no LLM, no history). Channel radio checks not
+            # addressed to us stay silent: answering every ch0 ping would burn airtime.
+            if is_dm:
+                rc = radio_check_reply(text, packet, len(getattr(interface, "nodes", None) or {}))
+                if rc is not None and not _is_duplicate(packet.get("id")):
+                    _send_and_log(lambda: interface.sendText(rc, destinationId=sender, wantAck=True, replyId=mesh_id),
+                                  sender, node_name, ch, True, True, rc, reply_to_id=mesh_id)
             return
         query = text[len(PREFIX):].strip()
         if is_dm:
@@ -1264,6 +1313,13 @@ def on_receive(packet=None, interface=None):
         if _is_duplicate(packet.get("id")):
             log("dropping duplicate retransmit from {} (pkt_id={}, query={!r})".format(
                 sender, packet.get("id"), query))
+            return
+        # Radio checks are answered deterministically and immediately — never queued,
+        # never sent to the LLM, exempt from the cooldown (an unanswered radio check
+        # is indistinguishable from a dead node, which defeats its purpose).
+        rc = radio_check_reply(query, packet, len(getattr(interface, "nodes", None) or {}))
+        if rc is not None:
+            send(rc)   # the quoted-send wrapper threads it to the ping via replyId
             return
         # "more" is a user-pulled continuation of an already-generated reply — exempting it
         # from the cooldown lets the next installment come immediately (dedup still applies).
@@ -1429,7 +1485,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v13 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v14 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
