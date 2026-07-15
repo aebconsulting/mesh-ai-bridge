@@ -79,8 +79,9 @@ def test_wired_into_both_paths():
     # @ai path: after dedup, before the cooldown block; bare-DM path inside `if not is_ai`
     assert SRC.count("radio_check_reply(") >= 3          # def + 2 call sites
     # v15: both call sites pass total-known AND the live online count
-    assert "rc = radio_check_reply(query, packet, len(_nodes), count_online(_nodes, time.time()))" in SRC
-    assert "rc = radio_check_reply(text, packet, len(_nodes), count_online(_nodes, time.time()))" in SRC
+    # (v18: live_online_count prefers MeshMonitor's view, falls back to count_online)
+    assert "rc = radio_check_reply(query, packet, len(_nodes), live_online_count(_nodes, time.time()))" in SRC
+    assert "rc = radio_check_reply(text, packet, len(_nodes), live_online_count(_nodes, time.time()))" in SRC
     # the @ai call must come AFTER the dedup guard and BEFORE the cooldown exemption comment
     i_dedup = SRC.index("dropping duplicate retransmit")
     i_rc = SRC.index("rc = radio_check_reply(query, packet,")

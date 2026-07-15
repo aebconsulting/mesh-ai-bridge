@@ -495,7 +495,7 @@ def test_never_raises_and_subscribed():
     fn(packet=None, interface=None)          # must swallow
     fn(packet={"decoded": "garbage"}, interface=None)
     assert 'pub.subscribe(on_traceroute, "meshtastic.receive")' in SRC
-    assert "mesh-ai-bridge v17 starting" in SRC
+    assert "mesh-ai-bridge v18 starting" in SRC  # banner tracks current version
 
 # ---------- Review findings on on_traceroute (post-Task-4) ----------
 

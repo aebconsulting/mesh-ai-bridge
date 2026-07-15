@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""mesh-ai-bridge v17 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+"""mesh-ai-bridge v18 - Meshtastic (serial or TCP) -> local LLM, with persistent memory.
+
+v18: the radio-check pong's online count prefers MeshMonitor's view. The bridge's
+own nodedb sits BEHIND MeshMonitor's virtual-node feed, which only re-forwards
+decoded app traffic -- MeshMonitor itself logs every packet HEADER the radio hears,
+including encrypted foreign-channel traffic (measured 2026-07-15: MM 95 vs bridge
+29 nodes in the same 2h window; the pong said 73 while the Meridian UI said 120).
+With MESHMONITOR_API_URL set the pong quotes MeshMonitor's count; unset, down, or
+garbage falls back to the bridge's own count -- exactly the v15 behavior. The
+fetch is cached (successes AND failures) so the pong path stays instant.
 
 v17 adds operator-triggered mesh traceroute: POST /api/traceroute fires a non-blocking
 route-discovery probe (sendData(wantResponse=True), never the blocking sendTraceRoute)
@@ -1108,7 +1117,9 @@ class SendHandler(BaseHTTPRequestHandler):
                           "acks_seen": acks_seen, "acks_matched": acks_matched,
                           "ack_orphans": ack_orphans, "ack_db_errors": ack_db_errors,
                           "sends_without_id": sends_without_id,
-                          "last_ack_ts": last_ack_ts or None})
+                          "last_ack_ts": last_ack_ts or None,
+                          "mm_online": _mm_online_cache["count"],
+                          "mm_online_ts": _mm_online_cache["ts"] or None})
 
     def do_POST(self):
         if self.path == "/api/traceroute":
@@ -1364,6 +1375,11 @@ RADIO_CHECK_COOLDOWN_S = int(os.environ.get("RADIO_CHECK_COOLDOWN_S", "120"))
 # v15: pong reports nodes heard within this window (2h = the dashboard's "online"
 # convention, so the pong and Meridian agree) instead of total nodedb size.
 ONLINE_WINDOW_S = int(os.environ.get("ONLINE_WINDOW_S", "7200"))
+# v18: MeshMonitor's online count beats the bridge's own (see module docstring).
+# Reachable by container name on project-nomad_default (e.g. http://meshmonitor-eval:3001).
+MESHMONITOR_API_URL = os.environ.get("MESHMONITOR_API_URL", "").rstrip("/")
+MM_ONLINE_TTL_S = int(os.environ.get("MM_ONLINE_TTL_S", "60"))
+_mm_online_cache = {"count": None, "ts": 0.0}   # radio thread only
 _rc_last = {}   # sender -> last channel-pong ts (radio thread only)
 
 # v17: mesh traceroute. Firmware rate-limits route discovery (~30s); one GLOBAL
@@ -1409,6 +1425,44 @@ def count_online(nodes, now, window_s=None):
             if now - lh <= window_s:
                 n += 1
     return n if seen else None
+
+def mm_online_count(now, url, window_s, cache, ttl_s, fetch):
+    """Nodes MeshMonitor heard within window_s, or None (URL unset, fetch failed,
+    or garbage payload -- the caller falls back to the bridge's own count).
+    Failures are cached exactly like successes so a down MeshMonitor costs one
+    short-timeout attempt per TTL, never one per ping: the pong path must stay
+    effectively instant. fetch is injected (url -> parsed JSON) for testability."""
+    if not url:
+        return None
+    if now - cache["ts"] < ttl_s:
+        return cache["count"]
+    count = None
+    try:
+        raw = fetch(url + "/api/nodes")
+        raw = raw if isinstance(raw, list) else raw.get("nodes", [])
+        if not isinstance(raw, list):
+            raise ValueError("nodes payload is not a list")
+        n, seen = 0, False
+        for v in raw:
+            lh = v.get("lastHeard") if isinstance(v, dict) else None
+            if isinstance(lh, (int, float)) and not isinstance(lh, bool):
+                seen = True
+                if now - lh <= window_s:
+                    n += 1
+        count = n if seen else None
+    except Exception:
+        count = None
+    cache["ts"] = now
+    cache["count"] = count
+    return count
+
+def live_online_count(nodes, now):
+    """The pong's online count: MeshMonitor's when available (closest to the
+    radio's real reach), else the bridge's own nodedb count (v15 behavior)."""
+    c = mm_online_count(now, MESHMONITOR_API_URL, ONLINE_WINDOW_S,
+                        _mm_online_cache, MM_ONLINE_TTL_S,
+                        lambda u: requests.get(u, timeout=2).json())
+    return c if c is not None else count_online(nodes, now)
 
 def radio_check_allowed(sender, now, last_map, cooldown_s):
     """Per-sender cooldown for PUBLIC (channel) radio-check pongs. Mutates
@@ -1594,7 +1648,7 @@ def on_receive(packet=None, interface=None):
             # publicly, threaded to the ping, behind a per-sender cooldown (the mesh
             # has other auto-responders and airtime is shared).
             _nodes = getattr(interface, "nodes", None) or {}
-            rc = radio_check_reply(text, packet, len(_nodes), count_online(_nodes, time.time()))
+            rc = radio_check_reply(text, packet, len(_nodes), live_online_count(_nodes, time.time()))
             if rc is not None and not _is_duplicate(packet.get("id")):
                 if is_dm:
                     _send_and_log(lambda: interface.sendText(rc, destinationId=sender, wantAck=True, replyId=mesh_id),
@@ -1633,7 +1687,7 @@ def on_receive(packet=None, interface=None):
         # never sent to the LLM, exempt from the cooldown (an unanswered radio check
         # is indistinguishable from a dead node, which defeats its purpose).
         _nodes = getattr(interface, "nodes", None) or {}
-        rc = radio_check_reply(query, packet, len(_nodes), count_online(_nodes, time.time()))
+        rc = radio_check_reply(query, packet, len(_nodes), live_online_count(_nodes, time.time()))
         if rc is not None:
             send(rc)   # the quoted-send wrapper threads it to the ping via replyId
             return
@@ -1849,7 +1903,7 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
     link = "tcp={}:{}".format(TCP_HOST, TCP_PORT) if TCP_HOST else "serial={}".format(SERIAL)
-    log("mesh-ai-bridge v17 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
+    log("mesh-ai-bridge v18 starting (net_backup={}): {} model={} prefix={} channels={} db={}".format(
         "on" if NET_BACKUP else "off",
         link, MODEL, repr(PREFIX), sorted(ALLOWED), MEM_DB))
     load_books()
